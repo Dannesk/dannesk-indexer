@@ -1,0 +1,24 @@
+[package]
+name = "indexd"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bitcoin address index for a pruned Bitcoin Core node"
+repository = "https://github.com/Dannesk/dannesk-indexer"
+publish = false
+
+[dependencies]
+tokio = { version = "1.53.3", features = ["full"] }
+tokio-tungstenite = "0.30.0"   
+futures-util = "0.3.34"
+serde = { version = "1.0.229", features = ["derive"] }   
+serde_json = "1.0.151"
+reqwest = { version = "0.13.5", features = ["json"] }   # rpc.rs — bitcoind JSON-RPC
+anyhow = "1.0.104"
+dashmap = "6.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "registry"] }
+tracing-appender = "0.2.5"
+redb = { version = "4.4.0", features = ["logging"] }  # address→UTXO store — MVCC: reads never block on the writer
+dannesk-btc-codec = { git = "https://github.com/Dannesk/dannesk-btc-codec", rev = "f206fd8c19c10fb49b9629f100a7a1888dd1ad2e" }  # address ↔ scriptPubKey for index keys, transactions and blocks
+zeromq = "0.6.0"           # bitcoind's hashblock, rawtx and sequence feeds 
