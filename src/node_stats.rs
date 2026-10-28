@@ -380,7 +380,8 @@ fn sorted_rates(mp: &Value) -> Vec<(String, f64, u64)> {
         .map(|o| {
             o.iter()
                 .filter_map(|(txid, e)| {
-                    let vsize = e["vsize"].as_u64().filter(|v| *v > 0)?;
+                    // The sigop-adjusted size miners rank by: vsize_adjusted since Core 32, vsize before.
+                    let vsize = e["vsize_adjusted"].as_u64().or_else(|| e["vsize"].as_u64()).filter(|v| *v > 0)?;
                     let base = e["fees"]["base"].as_f64()?;
                     Some((txid.clone(), base * 1e8 / vsize as f64, vsize))
                 })
@@ -506,10 +507,23 @@ mod tests {
         for (i, (rate, vsize)) in items.iter().enumerate() {
             o.insert(
                 format!("tx{i}"),
-                json!({ "vsize": vsize, "fees": { "base": rate * *vsize as f64 / 1e8 } }),
+                json!({ "vsize_adjusted": vsize, "fees": { "base": rate * *vsize as f64 / 1e8 } }),
             );
         }
         Value::Object(o)
+    }
+
+    #[test]
+    fn the_adjusted_size_is_read_first_and_the_old_key_still_counts() {
+        let mut o = serde_json::Map::new();
+        o.insert("core32".into(), json!({ "vsize_adjusted": 1_000, "vsize": 500, "fees": { "base": 0.00001 } }));
+        o.insert("core31".into(), json!({ "vsize": 400, "fees": { "base": 0.00002 } }));
+        let rates = sorted_rates(&Value::Object(o));
+        assert_eq!(rates.len(), 2);
+        assert_eq!((rates[0].0.as_str(), rates[0].2), ("core31", 400), "the old key alone is still a size");
+        assert!((rates[0].1 - 5.0).abs() < 1e-9);
+        assert_eq!((rates[1].0.as_str(), rates[1].2), ("core32", 1_000), "vsize_adjusted wins over vsize");
+        assert!((rates[1].1 - 1.0).abs() < 1e-9);
     }
 
     fn tiers(mp: &Value, floor: f64) -> [f64; 4] {
@@ -556,7 +570,7 @@ mod tests {
     #[test]
     fn malformed_entries_are_skipped_not_fatal() {
         let mut o = serde_json::Map::new();
-        o.insert("good".into(), json!({ "vsize": 1_000_000, "fees": { "base": 0.05 } }));
+        o.insert("good".into(), json!({ "vsize_adjusted": 1_000_000, "fees": { "base": 0.05 } }));
         o.insert("no_vsize".into(), json!({ "fees": { "base": 0.01 } }));
         o.insert("zero_vsize".into(), json!({ "vsize": 0, "fees": { "base": 0.01 } }));
         o.insert("no_fees".into(), json!({ "vsize": 500 }));

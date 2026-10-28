@@ -406,7 +406,8 @@ async fn build_mempool_frame(
                 .as_f64()
                 .map(|f| ((f * 1e8).round() as u64).to_string())
                 .unwrap_or_else(|| "0".to_string()),
-            entry["vsize"].as_u64(),
+            // vsize depcreated in version 32
+            entry["vsize_bip141"].as_u64().or_else(|| entry["vsize"].as_u64()),
         ),
         Err(_) => ("0".to_string(), None),
     };
