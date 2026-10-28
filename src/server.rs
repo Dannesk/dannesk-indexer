@@ -67,7 +67,9 @@ pub async fn run(
                 let rpc = rpc.clone();
                 let shutdown = shutdown.clone();
                 conns.spawn(async move {
-                    match tokio_tungstenite::accept_async(stream).await {
+                    // A relay's whole address list is one text frame, so the default 16 MiB ceiling is raised.
+                    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default().max_frame_size(Some(64 << 20));
+                    match tokio_tungstenite::accept_async_with_config(stream, Some(config)).await {
                         Ok(ws) => {
                             if let Err(e) = serve(ws, state_rx, node_rx, stats_rx, ready_rx, rpc, shutdown).await {
                                 debug!("connection from {} ended: {:?}", peer, e);
@@ -88,6 +90,20 @@ pub async fn run(
 
 async fn stopping(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|stop| *stop).await;
+}
+
+/// A watch or unwatch that arrives before `subscribed`, kept for after the list.
+fn note_early(text: &str, early: &mut Vec<(bool, String)>) -> Result<()> {
+    let frame = serde_json::from_str::<Value>(text).unwrap_or_default();
+    match (frame["method"].as_str(), frame["address"].as_str()) {
+        (Some("watch"), Some(a)) => early.push((true, a.to_string())),
+        (Some("unwatch"), Some(a)) => early.push((false, a.to_string())),
+        _ => debug!("unknown frame while waiting for the store: {}", text),
+    }
+    if early.len() > MAX_EARLY_FRAMES {
+        anyhow::bail!("more than {} watch frames before subscribed", MAX_EARLY_FRAMES);
+    }
+    Ok(())
 }
 
 async fn goodbye(sink: &mut SplitSink<WebSocketStream<TcpStream>, Message>) {
@@ -190,17 +206,7 @@ async fn subscribe(
                 Err(_) => node_open = false,
             },
             msg = stream.next() => match msg {
-                Some(Ok(Message::Text(text))) => {
-                    let frame = serde_json::from_str::<Value>(&text).unwrap_or_default();
-                    match (frame["method"].as_str(), frame["address"].as_str()) {
-                        (Some("watch"), Some(a)) => early.push((true, a.to_string())),
-                        (Some("unwatch"), Some(a)) => early.push((false, a.to_string())),
-                        _ => debug!("unknown frame while waiting for the store: {}", text),
-                    }
-                    if early.len() > MAX_EARLY_FRAMES {
-                        anyhow::bail!("more than {} watch frames before subscribed", MAX_EARLY_FRAMES);
-                    }
-                }
+                Some(Ok(Message::Text(text))) => note_early(&text, &mut early)?,
                 Some(Ok(Message::Ping(p))) => sink.send(Message::Pong(p)).await?,
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
                 Some(Ok(_)) => {}
@@ -211,11 +217,7 @@ async fn subscribe(
 
     let blocks_rx = ready.blocks.subscribe();
     let txs_rx = ready.txs.subscribe();
-    let mut addresses = 0;
-    for a in req["addresses"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-        ready.watch_state.watch(a);
-        addresses += 1;
-    }
+    // The pending sends first: a txid is a set insert, and the follower matches on it from here.
     let mut txids = 0;
     for t in req["txids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
         match valid_txid(t) {
@@ -226,7 +228,48 @@ async fn subscribe(
             None => debug!("subscribe_events: skipped invalid txid {}", t),
         }
     }
-    for (watch, a) in early {
+    // The list is registered on the blocking pool, each address being a store read: a relay's whole
+    // set must never leave this task silent, its pings unanswered and its goodbye unheard.
+    let listed: Vec<String> = req["addresses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect();
+    let mut registering = {
+        let state = ready.watch_state.clone();
+        tokio::task::spawn_blocking(move || {
+            for a in &listed {
+                state.watch(a);
+            }
+            listed.len()
+        })
+    };
+    let addresses = loop {
+        tokio::select! {
+            done = &mut registering => break done.map_err(|e| anyhow::anyhow!("address registration failed: {}", e))?,
+            _ = stopping(&mut shutdown) => {
+                goodbye(&mut sink).await;
+                return Ok(());
+            }
+            changed = state_watch.changed(), if state_open => match changed {
+                Ok(()) => sink.send(Message::text(status_frame(state_rx, node_rx))).await?,
+                Err(_) => state_open = false,
+            },
+            changed = node_watch.changed(), if node_open => match changed {
+                Ok(()) => sink.send(Message::text(status_frame(state_rx, node_rx))).await?,
+                Err(_) => node_open = false,
+            },
+            msg = stream.next() => match msg {
+                Some(Ok(Message::Text(text))) => note_early(&text, &mut early)?,
+                Some(Ok(Message::Ping(p))) => sink.send(Message::Pong(p)).await?,
+                Some(Ok(Message::Close(_))) | None => return Ok(()),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.into()),
+            },
+        }
+    };    for (watch, a) in early {
         if watch {
             ready.watch_state.watch(&a);
         } else {
@@ -749,8 +792,8 @@ async fn broadcast(req: &Value, state: &str, rpc: &BtcRpc) -> Value {
                 json!({ "state": state, "node_error": node_err })
             }
             None if never_sent(&e) => {
-                warn!("sendrawtransaction not sent, node unreachable: {:?}", e);
-                json!({ "state": state, "error": "bitcoin node unreachable", "unsent": true })
+                warn!("sendrawtransaction not sent: {:?}", e);
+                json!({ "state": state, "error": "bitcoin node not reached", "unsent": true })
             }
             None => {
                 error!("sendrawtransaction outcome unknown: {:?}", e);
@@ -985,6 +1028,116 @@ mod tests {
             Ready { idx, used, history, prune_rx, blocks, txs, watch_state },
             vec![index_path, used_path, history_path],
         )
+    }
+
+    #[tokio::test]
+    async fn the_enricher_asks_the_node_only_for_mirror_matches() {
+        use dannesk_btc_codec::tx::{OutPoint, SEQUENCE_FINAL, Transaction, TxIn, TxOut, Txid};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let paying = |to: &str, from: u8| Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: Txid::from_bytes([from; 32]), vout: 0 },
+                script_sig: vec![],
+                sequence: SEQUENCE_FINAL,
+                witness: vec![],
+            }],
+            output: vec![TxOut { value: 5_000, script_pubkey: BtcIndex::script_pubkey_for(to).unwrap() }],
+        };
+        let (pay, other) = (paying(ADDR, 0x11), paying(ADDR2, 0x22));
+        let (pay_txid, other_txid) = (pay.txid().to_string(), other.txid().to_string());
+        let asked = Arc::new(AtomicUsize::new(0));
+        let spend_asks = Arc::new(AtomicUsize::new(0));
+        let url = {
+            let (asked, spend_asks) = (Arc::clone(&asked), Arc::clone(&spend_asks));
+            let (pay_hex, other_hex) = (pay.to_hex(), other.to_hex());
+            let (pay_txid, other_txid) = (pay_txid.clone(), other_txid.clone());
+            fake_node(move |method, params| match method {
+                "getrawtransaction" => {
+                    asked.fetch_add(1, Ordering::Relaxed);
+                    match params[0].as_str().unwrap_or_default() {
+                        t if t == pay_txid => ok(json!(pay_hex)),
+                        t if t == other_txid => ok(json!(other_hex)),
+                        _ => err(-5, "No such mempool transaction"),
+                    }
+                }
+                "getmempoolentry" => ok(json!({ "vsize_bip141": 110, "fees": { "base": 0.00001 } })),
+                "gettxout" => ok(Value::Null),
+                "gettxspendingprevout" => {
+                    spend_asks.fetch_add(1, Ordering::Relaxed);
+                    ok(json!([]))
+                }
+                _ => err(-32601, "Method not found"),
+            })
+            .await
+        };
+        let (ready, paths) = ready();
+        let (txs, mut frames) = broadcast::channel::<String>(16);
+        let state = WatchState::new(ready.idx.clone()).with_enrichment(BtcRpc::for_test(&url), txs);
+        let mirror = state.mempool();
+        mirror.insert_live(&pay_txid, crate::mempool::output_spks(&pay), crate::mempool::input_prevouts(&pay));
+        mirror.insert_live(&other_txid, crate::mempool::output_spks(&other), crate::mempool::input_prevouts(&other));
+        state.watch(ADDR);
+        state.watch(ADDR2);
+        state.unwatch(ADDR2);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(asked.load(Ordering::Relaxed), 0, "nothing is asked before the mirror is warm");
+        mirror.set_warm();
+        let frame = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await.unwrap().unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "mempool_tx", "{v}");
+        assert_eq!(v["txid"], pay_txid);
+        assert_eq!(v["vsize"], 110);
+        assert_eq!(v["fees"], "1000");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(asked.load(Ordering::Relaxed), 1, "one getrawtransaction, for the match alone");
+        assert_eq!(spend_asks.load(Ordering::Relaxed), 0, "the node is never asked who spends what");
+        assert!(frames.try_recv().is_err(), "the address unwatched while queued produced nothing");
+        cleanup(paths);
+    }
+
+    #[tokio::test]
+    async fn a_reconciliation_lists_fetches_and_counts_what_it_could_not() {
+        use crate::mempool::{self, MempoolIndex};
+        use dannesk_btc_codec::tx::{OutPoint, SEQUENCE_FINAL, Transaction, TxIn, TxOut, Txid};
+        let listed = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: Txid::from_bytes([0x33; 32]), vout: 0 },
+                script_sig: vec![],
+                sequence: SEQUENCE_FINAL,
+                witness: vec![],
+            }],
+            output: vec![TxOut { value: 7_000, script_pubkey: BtcIndex::script_pubkey_for(ADDR).unwrap() }],
+        };
+        let (listed_txid, listed_hex) = (listed.txid().to_string(), listed.to_hex());
+        let url = {
+            let (t, h) = (listed_txid.clone(), listed_hex.clone());
+            fake_node(move |method, params| match method {
+                "getrawmempool" => ok(json!([t, "gone-meanwhile", "not-ready"])),
+                "getrawtransaction" => match params[0].as_str().unwrap_or_default() {
+                    x if x == t => ok(json!(h)),
+                    "gone-meanwhile" => err(-5, "No such mempool transaction"),
+                    _ => err(-28, "Loading block index"),
+                },
+                _ => err(-32601, "Method not found"),
+            })
+            .await
+        };
+        let rpc = BtcRpc::for_test(&url);
+        let mirror = MempoolIndex::default();
+        let stale_spk = vec![0x00, 0x14, 0x77];
+        mirror.insert_live("stale", vec![stale_spk.clone()], vec![]);
+        let walk = mempool::reconcile(&mirror, &rpc).await.unwrap();
+        assert_eq!(
+            (walk.added, walk.evicted, walk.failed, walk.total),
+            (1, 1, 1, 1),
+            "one fetched, the stale one gone, the one gone meanwhile skipped, the not-ready one counted"
+        );
+        assert!(mirror.txids_for_spk(&stale_spk).is_empty(), "what the node no longer lists is evicted");
+        assert_eq!(mirror.txids_for_spk(&BtcIndex::script_pubkey_for(ADDR).unwrap()), vec![listed_txid]);
     }
 
     fn cleanup(paths: Vec<PathBuf>) {

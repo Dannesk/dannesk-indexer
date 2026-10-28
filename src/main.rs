@@ -237,7 +237,7 @@ async fn main() -> Result<()> {
 
     let watch_state =
         watch::WatchState::new(idx.clone()).with_enrichment(rpc.clone(), txs_tx.clone());
-    mempool::spawn_warmup(watch_state.mempool(), rpc.clone());
+    mempool::spawn_walker(watch_state.mempool(), rpc.clone());
 
     btc_index::sync::spawn(
         idx.clone(),
