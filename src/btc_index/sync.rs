@@ -1,6 +1,7 @@
 
 use anyhow::{Context, Result, bail};
 use dashmap::DashSet;
+use redb::ReadableMultimapTable;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -236,7 +237,7 @@ fn apply_block(idx: &BtcIndex, used: &UsedSet, hist: &HistoryIndex, block: &Valu
                     .as_str()
                     .context("vout: no script hex")?,
             )?;
-            if spk.first() == Some(&0x6a) || spk.len() > 10_000 {
+            if !indexed_script(&spk) {
                 continue;
             }
             watched = watched || events.watched.contains(&spk);
@@ -279,16 +280,44 @@ fn apply_block(idx: &BtcIndex, used: &UsedSet, hist: &HistoryIndex, block: &Valu
     used_scripts.dedup();
 
     let write = idx.db.begin_write()?;
-    let mut spends_not_indexed = 0u32;
+    let (mut spends_not_indexed, mut spends_missing) = (0u32, 0u32);
+    let mut first_missing: Option<String> = None;
     {
         let mut utxos = write.open_multimap_table(UTXOS)?;
-        for (spk, rec) in &spent {
-            if !utxos.remove(spk.as_slice(), rec.encode().as_slice())? {
-                spends_not_indexed += 1;
-            }
-        }
+        // a coin the block both creates and spends must not outlive it.
         for (spk, rec) in &created {
             utxos.insert(spk.as_slice(), rec.encode().as_slice())?;
+        }
+        for (spk, rec) in &spent {
+            if !utxos.remove(spk.as_slice(), rec.encode().as_slice())? {
+                if never_indexed(spk) {
+                    spends_not_indexed += 1;
+                } else {
+                    spends_missing += 1;
+                    if first_missing.is_none() {
+                        let encoded = rec.encode();
+                        let mut held = None;
+                        for value in utxos.get(spk.as_slice())? {
+                            let value = value?;
+                            if value.value().get(..36) == Some(&encoded[..36]) {
+                                held = Some(short_hex(value.value()));
+                                break;
+                            }
+                        }
+                        let txid: String = rec.txid.iter().rev().map(|b| format!("{:02x}", b)).collect();
+                        first_missing = Some(match held {
+                            Some(other) => format!(
+                                "{}:{} under script {}, held with another record {}",
+                                txid,
+                                rec.vout,
+                                short_hex(spk),
+                                other
+                            ),
+                            None => format!("{}:{} under script {}, absent", txid, rec.vout, short_hex(spk)),
+                        });
+                    }
+                }
+            }
         }
         let mut undo = write.open_table(UNDO)?;
         let row = UndoRow {
@@ -322,6 +351,15 @@ fn apply_block(idx: &BtcIndex, used: &UsedSet, hist: &HistoryIndex, block: &Valu
         debug!(
             "block {}: {} spends not in index (uncompressed-P2PK era)",
             height, spends_not_indexed
+        );
+    }
+    if spends_missing > 0 {
+        warn!(
+            "block {} ({}): {} spent coin(s) the index should hold were not found as recorded; the first is {}",
+            height,
+            block["hash"].as_str().unwrap_or_default(),
+            spends_missing,
+            first_missing.as_deref().unwrap_or("unknown")
         );
     }
     Ok(())
@@ -464,9 +502,25 @@ pub(super) fn hex_decode(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+pub(super) fn indexed_script(spk: &[u8]) -> bool {
+    spk.first() != Some(&0x6a) && spk.len() <= 10_000
+}
+
+fn never_indexed(spk: &[u8]) -> bool {
+    (spk.len() == 67 && spk[0] == 0x41 && spk[1] == 0x04 && spk[66] == 0xac) || !indexed_script(spk)
+}
+
+fn short_hex(b: &[u8]) -> String {
+    let hex: String = b.iter().take(48).map(|x| format!("{:02x}", x)).collect();
+    if b.len() > 48 { format!("{}… ({} bytes)", hex, b.len()) } else { hex }
+}
+
+pub(super) fn btc_to_sats(btc: f64) -> u64 {
+    (btc * 100_000_000.0).round() as u64
+}
+
 fn sats(v: &Value) -> Result<u64> {
-    let btc = v.as_f64().context("amount: not a number")?;
-    Ok((btc * 100_000_000.0).round() as u64)
+    Ok(btc_to_sats(v.as_f64().context("amount: not a number")?))
 }
 
 #[cfg(test)]
@@ -636,6 +690,120 @@ mod tests {
         rewind_one(&idx, &temp_used(), &temp_hist(), &ev()).unwrap();
         assert!(rewind_one(&idx, &temp_used(), &temp_hist(), &ev()).is_err());
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_coin_created_and_spent_in_one_block_leaves_no_trace() {
+        let (idx, path) = temp_index();
+        let spk_a = BtcIndex::script_pubkey_for(ADDR_A).unwrap();
+        let spk_b = BtcIndex::script_pubkey_for(ADDR_B).unwrap();
+        seed(&idx, &spk_a);
+        let mut block = block_101(&spk_a, &spk_b);
+        block["tx"].as_array_mut().unwrap().push(json!({
+            "txid": hex_rev(&[0xCC; 32]),
+            "fee": 0.00001,
+            "vin": [{
+                "txid": hex_rev(&[0xBB; 32]),
+                "vout": 1,
+                "prevout": {
+                    "height": 101,
+                    "value": 0.00019,
+                    "scriptPubKey": { "hex": hex::encode_dummy(&spk_a) }
+                }
+            }],
+            "vout": [{ "n": 0, "value": 0.00018, "scriptPubKey": { "hex": hex::encode_dummy(&spk_b) } }]
+        }));
+        block["tx"].as_array_mut().unwrap().push(json!({
+            "txid": hex_rev(&[0xDD; 32]),
+            "fee": 0.00001,
+            "vin": [{
+                "txid": hex_rev(&[0xCC; 32]),
+                "vout": 0,
+                "prevout": {
+                    "height": 101,
+                    "value": 0.00018,
+                    "scriptPubKey": { "hex": hex::encode_dummy(&spk_b) }
+                }
+            }],
+            "vout": [{ "n": 0, "value": 0.00017, "scriptPubKey": { "hex": hex::encode_dummy(&spk_a) } }]
+        }));
+        let after = |idx: &BtcIndex| {
+            assert_eq!(
+                idx.query_spk(&spk_a).unwrap(),
+                AddressBalance { sats: 17_000, utxo_count: 1 },
+                "of the chain BB:1 → CC:0 → DD:0 only DD:0 is left"
+            );
+            assert_eq!(
+                idx.query_spk(&spk_b).unwrap(),
+                AddressBalance { sats: 312_530_000, utxo_count: 2 }
+            );
+        };
+        let before = |idx: &BtcIndex| {
+            assert_eq!(
+                idx.query_spk(&spk_a).unwrap(),
+                AddressBalance { sats: 50_000, utxo_count: 1 }
+            );
+            assert_eq!(
+                idx.query_spk(&spk_b).unwrap(),
+                AddressBalance { sats: 0, utxo_count: 0 }
+            );
+        };
+
+        apply_block(&idx, &temp_used(), &temp_hist(), &block, &sinks(&[]).0).unwrap();
+        after(&idx);
+        rewind_one(&idx, &temp_used(), &temp_hist(), &ev()).unwrap();
+        before(&idx);
+
+        apply_block(&idx, &temp_used(), &temp_hist(), &block, &sinks(&[]).0).unwrap();
+        after(&idx);
+        let left_over = UtxoRecord { txid: [0xBB; 32], vout: 1, sats: 19_000, height: 101 };
+        idx.insert_for_test(&spk_a, &left_over).unwrap();
+        rewind_one(&idx, &temp_used(), &temp_hist(), &ev()).unwrap();
+        before(&idx);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn only_dump_era_p2pk_and_unstored_scripts_count_as_never_indexed() {
+        let p2pk = |prefix: u8| [vec![0x41, prefix], vec![0x11; 64], vec![0xac]].concat();
+        assert!(never_indexed(&p2pk(0x04)), "uncompressed P2PK, which the dump skipped");
+        assert!(!never_indexed(&p2pk(0x06)), "a hybrid key the dump kept");
+        assert!(never_indexed(&[0x6a, 0x01, 0x00]));
+        assert!(never_indexed(&vec![0x51; 10_001]));
+        assert!(!never_indexed(&BtcIndex::script_pubkey_for(ADDR_A).unwrap()));
+    }
+
+    #[test]
+    fn the_repair_names_the_exact_record_apply_block_writes() {
+        let (idx, path) = temp_index();
+        let spk_a = BtcIndex::script_pubkey_for(ADDR_A).unwrap();
+        let spk_b = BtcIndex::script_pubkey_for(ADDR_B).unwrap();
+        seed(&idx, &spk_a);
+        // As bitcoind prints it. amounts of eight decimals.
+        let text = r#"{"height":101,"hash":"H1","previousblockhash":"H0","time":1786761453,"tx":[
+            {"txid":"TBB","fee":0.00001000,"vin":[{"txid":"TAA","vout":0,"prevout":{"height":90,"value":0.00050000,"scriptPubKey":{"hex":"SA"}}}],
+             "vout":[{"n":0,"value":0.00030000,"scriptPubKey":{"hex":"SB"}},{"n":1,"value":0.00019000,"scriptPubKey":{"hex":"SA"}}]},
+            {"txid":"TCC","fee":0.00001000,"vin":[{"txid":"TBB","vout":1,"prevout":{"height":101,"value":0.00019000,"scriptPubKey":{"hex":"SA"}}}],
+             "vout":[{"n":0,"value":0.00018000,"scriptPubKey":{"hex":"SB"}}]}]}"#
+            .replace("H1", &hex_rev(&[2u8; 32]))
+            .replace("H0", &hex_rev(&[1u8; 32]))
+            .replace("TAA", &hex_rev(&[0xAA; 32]))
+            .replace("TBB", &hex_rev(&std::array::from_fn(|i| 0xB0u8.wrapping_add(i as u8 * 7))))
+            .replace("TCC", &hex_rev(&std::array::from_fn(|i| 0xC0u8.wrapping_add(i as u8 * 5))))
+            .replace("SA", &hex::encode_dummy(&spk_a))
+            .replace("SB", &hex::encode_dummy(&spk_b));
+        let mut unspent: Value = serde_json::from_str(&text).unwrap();
+        unspent["tx"].as_array_mut().unwrap().pop();
+        apply_block(&idx, &temp_used(), &temp_hist(), &unspent, &sinks(&[]).0).unwrap();
+        let written = idx.utxos_for_spk(&spk_a).unwrap();
+
+        let named =
+            crate::btc_index::repair::same_block_coins(101, &serde_json::from_str(&text).unwrap()).unwrap();
+        assert_eq!(named.len(), 1, "BB:1 is created and spent by CC");
+        assert_eq!(named[0].0, spk_a);
+        assert_eq!(written, vec![named[0].1.clone()], "without its spender, BB:1 is exactly the record named");
         let _ = std::fs::remove_file(path);
     }
 

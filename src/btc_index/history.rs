@@ -633,7 +633,7 @@ async fn run(hist: HistoryIndex, rpc: BtcRpc, mut state_rx: watch::Receiver<Inde
     }
 }
 
-async fn prune_height(rpc: &BtcRpc) -> Result<u32> {
+pub(super) async fn prune_height(rpc: &BtcRpc) -> Result<u32> {
     let v: Value = rpc.call("getblockchaininfo", json!([])).await?;
     Ok(v["pruneheight"].as_u64().unwrap_or(0) as u32)
 }

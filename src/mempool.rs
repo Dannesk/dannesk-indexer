@@ -22,7 +22,7 @@ const WALK_MIN_GAP: Duration = Duration::from_secs(30);
 const FETCH_CONCURRENCY: usize = 4;
 const RPC_NOT_IN_MEMPOOL: i64 = -5;
 
-/// An outpoint as 36 bytes: the txid in the node's internal byte order.
+/// An outpoint as 36 bytes...node's internal byte order.
 pub type OutpointKey = [u8; 36];
 
 pub struct MempoolIndex {
@@ -39,7 +39,6 @@ pub struct MempoolIndex {
 struct Entry {
     spks: Vec<Vec<u8>>,
     prevouts: Vec<OutpointKey>,
-    /// When the node last vouched for it; a reconciliation judges what is older than its listing.
     generation: u64,
 }
 
@@ -59,7 +58,6 @@ impl Default for MempoolIndex {
 }
 
 impl MempoolIndex {
-    /// The node just accepted this exact transaction, so its claims on its inputs are current.
     pub fn insert_live(&self, txid: &str, spks: Vec<Vec<u8>>, prevouts: Vec<OutpointKey>) {
         if let Some(mut entry) = self.by_txid.get_mut(txid) {
             entry.generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -72,7 +70,6 @@ impl MempoolIndex {
         self.store(txid, spks, prevouts, true);
     }
 
-    /// From a listing of the mempool: older than anything the follower saw since, so it never displaces a claim.
     pub fn insert_listed(&self, txid: &str, spks: Vec<Vec<u8>>, prevouts: Vec<OutpointKey>) {
         if self.by_txid.contains_key(txid) {
             return;
@@ -130,7 +127,6 @@ impl MempoolIndex {
         entry.spks
     }
 
-    /// What the node vouched for no later than `generation` and a listing no longer names.
     fn gone_since(&self, generation: u64, listed: &HashSet<String>) -> Vec<String> {
         self.by_txid
             .iter()
@@ -139,7 +135,6 @@ impl MempoolIndex {
             .collect()
     }
 
-    /// A vanished transaction goes to the watch side's drop queue, which undoes it as it would a ZMQ drop; without which it is simply evicted.
     fn drop_or_evict(&self, txid: String) {
         match self.dropped.get() {
             Some(queue) if queue.send(txid.clone()).is_ok() => {}
@@ -149,7 +144,6 @@ impl MempoolIndex {
         }
     }
 
-    /// Hands out the drop queue once and then the watch side drains it.
     pub fn drop_queue(&self) -> mpsc::UnboundedReceiver<String> {
         let (tx, rx) = mpsc::unbounded_channel();
         if self.dropped.set(tx).is_err() {
@@ -165,13 +159,11 @@ impl MempoolIndex {
             .unwrap_or_default()
     }
 
-    /// The mempool transaction spending `outpoint` ("txid:vout", as the tracker keys it), if any.
     pub fn spender_of(&self, outpoint: &str) -> Option<String> {
         let key = outpoint_key(outpoint)?;
         self.by_prevout.get(&key).map(|e| e.value().to_string())
     }
 
-    /// The transaction's parents that are themselves in the mempool, as displayed txids.
     pub fn parents_in_mempool(&self, txid: &str) -> Vec<String> {
         let candidates: Vec<String> = match self.by_txid.get(txid) {
             Some(entry) => entry.prevouts.iter().map(|key| display_txid(&key[..32])).collect(),
@@ -198,12 +190,12 @@ impl MempoolIndex {
         self.warm.send_replace(true);
     }
 
-    /// Asks the walker for a reconciliation; requests coalesce.
+    /// Asks the walker for a reconciliation
     pub fn request_walk(&self) {
         self.walk.notify_one();
     }
 
-    fn contains(&self, txid: &str) -> bool {
+    pub(crate) fn contains(&self, txid: &str) -> bool {
         self.by_txid.contains_key(txid)
     }
 
@@ -236,7 +228,7 @@ pub fn prevout_key(op: &OutPoint) -> OutpointKey {
     key
 }
 
-/// A txid in the node's internal byte order, as it is displayed.
+/// A txid in the node's internal byte order
 fn display_txid(internal: &[u8]) -> String {
     internal.iter().rev().map(|b| format!("{:02x}", b)).collect()
 }
@@ -262,12 +254,10 @@ pub fn output_spks(tx: &Transaction) -> Vec<Vec<u8>> {
 pub(crate) struct Walk {
     pub added: usize,
     pub evicted: usize,
-    /// Listed transactions the node would not hand over: because the mirror has holes until the next walk.
     pub failed: usize,
     pub total: usize,
 }
 
-/// Keeps the mirror equal to the node's mempool.
 pub fn spawn_walker(index: Arc<MempoolIndex>, rpc: BtcRpc) {
     tokio::spawn(async move {
         let mut quiet_until: Option<tokio::time::Instant> = None;

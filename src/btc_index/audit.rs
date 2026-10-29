@@ -31,7 +31,7 @@ async fn run(idx: BtcIndex, rpc: BtcRpc, state_rx: watch::Receiver<IndexState>) 
     }
 }
 
-fn splitmix64(mut x: u64) -> u64 {
+pub(super) fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E3779B97F4A7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
@@ -75,7 +75,7 @@ async fn audit_one(idx: &BtcIndex, rpc: &BtcRpc) -> Result<()> {
 
     if expected.sats != got_sats || expected.utxo_count != got_count {
         error!(
-            "AUDIT MISMATCH at height {} for spk {}: index says {} sats/{} utxos, chainstate says {} sats/{} utxos — rebuild the index from a fresh dump",
+            "AUDIT MISMATCH at height {} for spk {}: index says {} sats/{} utxos, chainstate says {} sats/{} utxos — if the index holds coins the chain does not, run `indexd repair-same-block` first; otherwise rebuild the index from a fresh dump",
             scan_height, spk_hex, expected.sats, expected.utxo_count, got_sats, got_count
         );
     } else {

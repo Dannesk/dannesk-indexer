@@ -2,6 +2,7 @@
 pub mod audit;
 pub mod build;
 pub mod history;
+pub mod repair;
 pub mod store;
 pub mod sync;
 pub mod used;
@@ -27,6 +28,12 @@ pub struct AddressBalance {
     pub sats: u64,
     pub utxo_count: usize,
 }
+
+/// P2WPKH, P2WSH, P2TR, P2PKH and P2SH up to their first variable byte.
+const SAMPLED_TEMPLATES: [&[u8]; 5] = [&[0x00, 0x14], &[0x00, 0x20], &[0x51, 0x20], &[0x76, 0xa9, 0x14], &[0xa9, 0x14]];
+/// P2A, audited whether or not the index holds it.
+const SAMPLED_SCRIPTS: [&[u8]; 1] = [&[0x51, 0x02, 0x4e, 0x73]];
+const LEADING_BYTES: [&[u8]; 4] = [&[0x00], &[0x51], &[0x76], &[0xa9]];
 
 #[derive(Clone)]
 pub struct BtcIndex {
@@ -79,13 +86,32 @@ impl BtcIndex {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let mut start = [0u8; 9];
-        start[0] = [0x00u8, 0x51, 0x76, 0xa9][(seed % 4) as usize];
-        start[1..9].copy_from_slice(&seed.rotate_left(17).to_be_bytes());
-        let mut iter = table.range(&start[..]..)?;
-        if let Some(entry) = iter.next() {
-            let (key, _) = entry?;
-            return Ok(Some(key.value().to_vec()));
+
+        let buckets = (SAMPLED_TEMPLATES.len() + SAMPLED_SCRIPTS.len() + 1) as u64;
+        let bucket = (seed % buckets) as usize;
+        if let Some(script) = bucket.checked_sub(SAMPLED_TEMPLATES.len()).and_then(|i| SAMPLED_SCRIPTS.get(i)) {
+            return Ok(Some(script.to_vec()));
+        }
+        let random = seed.rotate_left(17).to_be_bytes();
+        let first_with = |prefix: &[u8]| -> Result<Option<Vec<u8>>> {
+            let mut start = prefix.to_vec();
+            start.extend_from_slice(&random);
+            for from in [&start[..], prefix] {
+                let mut iter = table.range(from..)?;
+                if let Some(entry) = iter.next() {
+                    let (key, _) = entry?;
+                    if key.value().starts_with(prefix) {
+                        return Ok(Some(key.value().to_vec()));
+                    }
+                }
+            }
+            Ok(None)
+        };
+        let leading = LEADING_BYTES[((seed >> 32) % LEADING_BYTES.len() as u64) as usize];
+        for prefix in SAMPLED_TEMPLATES.get(bucket).into_iter().chain([&leading]) {
+            if let Some(key) = first_with(prefix)? {
+                return Ok(Some(key));
+            }
         }
         let mut iter = table.range::<&[u8]>(..)?;
         match iter.next() {
@@ -208,8 +234,60 @@ mod tests {
         }
         write.commit().unwrap();
         for seed in 0..12u64 {
-            assert_eq!(idx.sample_spk(seed).unwrap(), Some(spk.clone()), "seed {}", seed);
+            let expected = if seed % 7 == 5 { SAMPLED_SCRIPTS[0].to_vec() } else { spk.clone() };
+            assert_eq!(idx.sample_spk(seed).unwrap(), Some(expected), "seed {}", seed);
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn samples_spread_over_each_templates_scripts_and_still_reach_the_rest() {
+        let (idx, path) = temp_index();
+        let p2wpkh = |i: u8| [vec![0x00, 0x14], vec![i.wrapping_mul(4); 20]].concat();
+        let p2tr = |i: u8| [vec![0x51, 0x20], vec![i.wrapping_mul(16); 32]].concat();
+        let p2a = vec![0x51, 0x02, 0x4e, 0x73];
+        let nonstandard = vec![0x51, 0x06, 0xca, 0x15, 0x6e, 0x51];
+        let write = idx.db.begin_write().unwrap();
+        {
+            let mut table = write.open_multimap_table(store::UTXOS).unwrap();
+            let mut put = |spk: &[u8]| table.insert(spk, rec(1, 42).encode().as_slice()).unwrap();
+            for i in 0..64u8 {
+                put(&p2wpkh(i));
+            }
+            for i in 0..16u8 {
+                put(&p2tr(i));
+            }
+            put(&p2a);
+            put(&nonstandard);
+        }
+        write.commit().unwrap();
+
+        let (mut wpkh_seen, mut tr_seen) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for n in 0..700u64 {
+            let seed = crate::btc_index::audit::splitmix64(n);
+            let spk = idx.sample_spk(seed).unwrap().unwrap();
+            match seed % 7 {
+                0 => {
+                    wpkh_seen.insert(spk);
+                }
+                2 => {
+                    tr_seen.insert(spk);
+                }
+                5 => assert_eq!(spk, p2a, "P2A has a bucket of its own"),
+                1 | 3 | 4 => match LEADING_BYTES[((seed >> 32) % 4) as usize][0] {
+                    lead @ (0x00 | 0x51) => assert_eq!(spk[0], lead, "an empty template falls back to the leading byte"),
+                    _ => assert_eq!(spk, p2wpkh(0), "and a leading byte with no scripts to the first key"),
+                },
+                _ => {}
+            }
+        }
+        assert!(wpkh_seen.iter().all(|s| s.starts_with(&[0x00, 0x14])) && wpkh_seen.len() > 20, "{} of 64", wpkh_seen.len());
+        assert!(tr_seen.iter().all(|s| s.starts_with(&[0x51, 0x20])) && tr_seen.len() > 8, "{} of 16", tr_seen.len());
+        assert_eq!(
+            idx.sample_spk((5 << 39) + (1 << 32) + 4).unwrap(),
+            Some(nonstandard),
+            "the leading-byte bucket starting at 51 05 still reaches a script no template covers"
+        );
         let _ = std::fs::remove_file(path);
     }
 

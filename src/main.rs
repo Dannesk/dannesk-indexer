@@ -83,6 +83,21 @@ async fn main() -> Result<()> {
             }
         };
     }
+    if args.get(1).map(String::as_str) == Some("repair-same-block") {
+        let usage = || -> ! {
+            eprintln!("usage: indexd repair-same-block <store-path> [from-height] [until-height]");
+            std::process::exit(2);
+        };
+        let height = |i: usize| match args.get(i).map(|h| h.parse::<u32>()) {
+            None => None,
+            Some(Ok(h)) => Some(h),
+            Some(Err(_)) => usage(),
+        };
+        let (from, until) = (height(3), height(4));
+        let Some(store) = args.get(2) else { usage() };
+        let _guard = init_logging();
+        return btc_index::repair::run_cli(store, from, until).await;
+    }
     if args.get(1).map(String::as_str) == Some("query-index") {
         return match (args.get(2), args.get(3)) {
             (Some(store), Some(address)) => {

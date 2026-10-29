@@ -182,12 +182,27 @@ impl WatchState {
         let Some(spk) = BtcIndex::script_pubkey_for(address) else {
             return;
         };
+        let key = |txid: &[u8; 32], vout: u32| -> String {
+            let txid: String = txid.iter().rev().map(|b| format!("{:02x}", b)).collect();
+            format!("{}:{}", txid, vout)
+        };
         match self.idx.utxos_for_spk(&spk) {
             Ok(records) => {
+                let mut seeded = Vec::with_capacity(records.len());
                 for rec in records {
-                    let txid: String =
-                        rec.txid.iter().rev().map(|b| format!("{:02x}", b)).collect();
-                    self.track(format!("{}:{}", txid, rec.vout), address, rec.sats);
+                    let k = key(&rec.txid, rec.vout);
+                    self.track(k.clone(), address, rec.sats);
+                    seeded.push(k);
+                }
+                // Read again, a block may have spent one in between.
+                match self.idx.utxos_for_spk(&spk) {
+                    Ok(now) => {
+                        let present: HashSet<String> = now.iter().map(|rec| key(&rec.txid, rec.vout)).collect();
+                        for k in spent_since(&seeded, &present, |txid| self.mempool.contains(txid)) {
+                            self.untrack(&k);
+                        }
+                    }
+                    Err(e) => warn!("tracker seed re-read failed for {}: {:?}", address, e),
                 }
             }
             Err(e) => warn!("tracker seed failed for {}: {:?}", address, e),
@@ -223,6 +238,15 @@ impl WatchState {
             })
             .collect()
     }
+}
+
+/// Seeded coins the second read lacks, unless a rewind sent their transaction back to the mempool.
+fn spent_since(seeded: &[String], present: &HashSet<String>, in_mempool: impl Fn(&str) -> bool) -> Vec<String> {
+    seeded
+        .iter()
+        .filter(|k| !present.contains(*k) && !k.split_once(':').is_some_and(|(txid, _)| in_mempool(txid)))
+        .cloned()
+        .collect()
 }
 
 pub fn spawn_rawtx(
@@ -378,7 +402,6 @@ struct Gap {
 }
 
 impl Gap {
-    /// One topic's frames are numbered consecutively so a jump is the publisher's queue overflowing, or the node restarting.
     fn noticed(&mut self, seq: u32) -> Option<u32> {
         let jumped = match self.last {
             Some(last) if seq != last.wrapping_add(1) => Some(last),
@@ -457,7 +480,7 @@ async fn build_mempool_frame(
             state.untracked_by.clear();
             state.spent_by.clear();
         }
-        // Merged, not replaced, because a rebuild that fails one lookup must not shrink the undo record.
+        // Merged, because a rebuild that fails one lookup should not shrink the undo record.
         let mut entry = state.untracked_by.entry(txid.to_string()).or_default();
         for item in untracked {
             if !entry.iter().any(|(key, _, _)| *key == item.0) {
@@ -534,7 +557,6 @@ async fn undo_dropped_tx(state: &WatchState, rpc: &BtcRpc, txid: &str) {
     }
 }
 
-// One worker: a relay's full address list after a reconnect is answered from the mirror, never fanned out to the node.
 fn spawn_enricher(
     state: WatchState,
     rpc: BtcRpc,
@@ -569,7 +591,6 @@ fn mempool_matches(state: &WatchState, address: &str) -> HashSet<String> {
     txids
 }
 
-// Parents first because a child's frame must find the coin its parent's frame tracked.
 fn parents_first(state: &WatchState, pending: &HashSet<String>) -> Vec<String> {
     let mut ready: Vec<String> = pending
         .iter()
@@ -583,7 +604,6 @@ fn parents_first(state: &WatchState, pending: &HashSet<String>) -> Vec<String> {
     ready
 }
 
-// Each frame can track new coins of the address, whose own spenders are then matches too.. run to the fixpoint.
 async fn enrich_watch(state: &WatchState, rpc: &BtcRpc, txs: &broadcast::Sender<String>, address: &str) {
     let mut done: HashSet<String> = HashSet::new();
     loop {
@@ -661,12 +681,15 @@ fn apply_block_to_tracker(state: &WatchState, event: &Value) {
         if !state.addresses.contains(address) {
             continue;
         }
-        for rec in change["spent"].as_array().into_iter().flatten() {
-            if let (Some(txid), Some(vout)) = (rec["txid"].as_str(), rec["vout"].as_u64()) {
-                let key = format!("{}:{}", txid, vout);
-                state.untrack(&key);
-                state.spent_by.remove(&key);
-            }
+        let spent: HashSet<String> = change["spent"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|rec| Some(format!("{}:{}", rec["txid"].as_str()?, rec["vout"].as_u64()?)))
+            .collect();
+        for key in &spent {
+            state.untrack(key);
+            state.spent_by.remove(key);
         }
         for rec in change["created"].as_array().into_iter().flatten() {
             if let (Some(txid), Some(vout), Some(sats)) = (
@@ -674,7 +697,10 @@ fn apply_block_to_tracker(state: &WatchState, event: &Value) {
                 rec["vout"].as_u64(),
                 rec["sats"].as_u64(),
             ) {
-                state.track(format!("{}:{}", txid, vout), address, sats);
+                let key = format!("{}:{}", txid, vout);
+                if !spent.contains(&key) {
+                    state.track(key, address, sats);
+                }
             }
         }
     }
@@ -923,6 +949,39 @@ mod tests {
         assert_eq!(s.untracked_by.get("t1").unwrap().value().len(), 1, "B's coin stays in the shared entry");
         assert_consistent(&s);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_coin_created_and_spent_in_one_block_is_not_tracked() {
+        let (s, path) = watch_state();
+        s.addresses.insert(A.to_string());
+        s.track("cc:0".into(), A, 9);
+        s.track("aa:0".into(), A, 5);
+        apply_block_to_tracker(
+            &s,
+            &json!({ "changes": [{
+                "address": A,
+                "created": [{ "txid": "aa", "vout": 0, "sats": 5 }, { "txid": "bb", "vout": 0, "sats": 4 }],
+                "spent": [{ "txid": "aa", "vout": 0 }, { "txid": "cc", "vout": 0 }]
+            }] }),
+        );
+        assert!(!s.tracker.contains_key("aa:0"), "created and spent in the block");
+        assert!(!s.tracker.contains_key("cc:0"), "spent by the block");
+        assert!(s.tracker.contains_key("bb:0"));
+        assert_consistent(&s);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_second_read_untracks_only_what_a_block_spent() {
+        let seeded = vec!["kept:0".to_string(), "spent:0".to_string(), "rewound:0".to_string()];
+        let present: HashSet<String> = ["kept:0".to_string()].into_iter().collect();
+        assert_eq!(
+            spent_since(&seeded, &present, |txid| txid == "rewound"),
+            vec!["spent:0".to_string()],
+            "a coin whose transaction is back in the mempool stays"
+        );
+        assert_eq!(spent_since(&seeded, &present, |_| false), vec!["spent:0".to_string(), "rewound:0".to_string()]);
     }
 
     #[test]
