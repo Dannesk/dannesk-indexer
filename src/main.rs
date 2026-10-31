@@ -44,10 +44,6 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     }
 }
 
-fn used_store_path(index_path: &str) -> String {
-    sibling_store_path(index_path, "BTC_USED_PATH", "used.redb")
-}
-
 fn history_store_path(index_path: &str) -> String {
     sibling_store_path(index_path, "BTC_HISTORY_PATH", "history.redb")
 }
@@ -70,15 +66,6 @@ async fn main() -> Result<()> {
             (Some(dump), Some(store)) => btc_index::build::run(dump, store),
             _ => {
                 eprintln!("usage: indexd build-index <dump-path> <store-path>");
-                std::process::exit(2);
-            }
-        };
-    }
-    if args.get(1).map(String::as_str) == Some("build-used") {
-        return match args.get(2) {
-            Some(store) => btc_index::used::run_cli(store).await,
-            None => {
-                eprintln!("usage: indexd build-used <store-path>");
                 std::process::exit(2);
             }
         };
@@ -212,7 +199,7 @@ async fn main() -> Result<()> {
     let (stats_tx, stats_rx) = tokio::sync::watch::channel(node_stats::NodeStats::default());
     node_stats::spawn(rpc.clone(), ready_rx.clone(), blocks_tx.clone(), stats_tx);
     let (txs_tx, _) = tokio::sync::broadcast::channel::<String>(256);
-    let zmq = "tcp://127.0.0.1:28332".to_string();
+    let zmq = std::env::var("BTC_ZMQ").unwrap_or_else(|_| "tcp://127.0.0.1:28332".to_string());
 
     let (server_stop_tx, server_stop_rx) = tokio::sync::watch::channel(false);
     let mut server = tokio::spawn(server::run(
@@ -228,15 +215,6 @@ async fn main() -> Result<()> {
     let idx = {
         let path = store_path.clone();
         tokio::task::spawn_blocking(move || btc_index::BtcIndex::open(&path)).await??
-    };
-    let used = {
-        let path = used_store_path(&store_path);
-        let opened = tokio::task::spawn_blocking(move || btc_index::used::UsedSet::open(&path)).await??;
-        match opened.cursor()? {
-            Some((h, _)) => info!("used set open (cursor at height {})", h),
-            None => error!("used set is EMPTY — run `indexd build-used` (daemon stopped); imports are refused until it exists"),
-        }
-        opened
     };
     let history = {
         let path = history_store_path(&store_path);
@@ -256,7 +234,6 @@ async fn main() -> Result<()> {
 
     btc_index::sync::spawn(
         idx.clone(),
-        used.clone(),
         history.clone(),
         rpc.clone(),
         zmq.clone(),
@@ -276,7 +253,6 @@ async fn main() -> Result<()> {
 
     ready_tx.send_replace(Some(server::Ready {
         idx,
-        used,
         history,
         prune_rx,
         blocks: blocks_tx,

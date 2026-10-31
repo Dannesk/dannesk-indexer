@@ -15,7 +15,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::btc_index::history::HistoryIndex;
 use crate::btc_index::{BtcIndex, IndexState};
-use crate::btc_index::used::UsedSet;
 use crate::node_probe::NodeState;
 use crate::node_stats::NodeStats;
 use crate::rpc::{BtcRpc, NodeError, never_sent};
@@ -23,7 +22,7 @@ use crate::watch::WatchState;
 
 const COINBASE_MATURITY: u64 = 100;
 
-pub const PROTOCOL: u64 = 3;
+pub const PROTOCOL: u64 = 4;
 
 const HISTORY_LIMIT: usize = 1000;
 
@@ -36,7 +35,6 @@ const MAX_EARLY_FRAMES: usize = 10_000;
 #[derive(Clone)]
 pub struct Ready {
     pub idx: BtcIndex,
-    pub used: UsedSet,
     pub history: HistoryIndex,
     pub prune_rx: watch::Receiver<u32>,
     pub blocks: broadcast::Sender<String>,
@@ -441,7 +439,7 @@ pub(crate) async fn answer(
     let node = node_rx.borrow().as_str();
 
     let Some(Ready {
-        idx, used, history, prune_rx, watch_state, ..
+        idx, history, prune_rx, watch_state, ..
     }) = ready
     else {
         return match req["method"].as_str() {
@@ -458,7 +456,7 @@ pub(crate) async fn answer(
                 Err(resp) => resp,
                 Ok(_) => json!({ "state": state }),
             },
-            Some("utxos_batch") | Some("used_batch") | Some("history") => json!({ "state": state }),
+            Some("history") => json!({ "state": state }),
             _ => json!({ "state": state, "error": "unknown method" }),
         };
     };
@@ -531,8 +529,6 @@ pub(crate) async fn answer(
             },
         },
 
-        Some("utxos_batch") => utxos_batch(req, idx, watch_state, state, rpc).await,
-        Some("used_batch") => used_batch(req, used, state),
         Some("history") => history_query(req, history, prune_rx, state),
 
         Some("spendable") => match spk_for(req, state) {
@@ -548,86 +544,6 @@ pub(crate) async fn answer(
         },
 
         _ => json!({ "state": state, "error": "unknown method" }),
-    }
-}
-
-async fn utxos_batch(req: &Value, idx: &BtcIndex, watch_state: &WatchState, state: &str, rpc: &BtcRpc) -> Value {
-    if state != "live" {
-        return json!({ "state": state });
-    }
-    let Some(addrs) = req["addresses"].as_array() else {
-        return json!({ "state": state, "error": "missing addresses" });
-    };
-    if addrs.len() > 8192 {
-        return json!({ "state": state, "error": "too many addresses" });
-    }
-    let mut sets: Vec<(String, Vec<Value>)> = Vec::new();
-    for addr in addrs {
-        let Some(a) = addr.as_str() else {
-            return json!({ "state": state, "error": "invalid address" });
-        };
-        let Some(spk) = BtcIndex::script_pubkey_for(a) else {
-            return json!({ "state": state, "error": "invalid address" });
-        };
-        match merged_utxos(idx, watch_state, Some(a), &spk) {
-            Ok(utxos) if utxos.is_empty() => {}
-            Ok(utxos) => sets.push((a.to_string(), utxos)),
-            Err(e) => {
-                error!("utxos_batch read failed for {}: {:?}", a, e);
-                return json!({ "state": state, "error": "index read failed" });
-            }
-        }
-    }
-    if let Err(e) = mark_unwatched_spends(rpc, watch_state, &mut sets).await {
-        warn!("gettxspendingprevout failed: {:?}", e);
-        return json!({ "state": state, "error": "node error during utxo check" });
-    }
-    let wallets: Vec<Value> = sets
-        .into_iter()
-        .map(|(address, utxos)| json!({ "address": address, "utxos": utxos }))
-        .collect();
-    json!({ "state": "live", "wallets": wallets })
-}
-
-fn used_batch(req: &Value, used: &UsedSet, state: &str) -> Value {
-    if state != "live" {
-        return json!({ "state": state });
-    }
-    let Some(addrs) = req["addresses"].as_array() else {
-        return json!({ "state": state, "error": "missing addresses" });
-    };
-    if addrs.len() > 8192 {
-        return json!({ "state": state, "error": "too many addresses" });
-    }
-    match used.cursor() {
-        Ok(Some(_)) => {}
-        Ok(None) => return json!({ "state": state, "error": "used set not built" }),
-        Err(e) => {
-            error!("used_batch cursor read failed: {:?}", e);
-            return json!({ "state": state, "error": "index read failed" });
-        }
-    }
-    let mut names = Vec::with_capacity(addrs.len());
-    let mut spks = Vec::with_capacity(addrs.len());
-    for addr in addrs {
-        let Some(a) = addr.as_str() else {
-            return json!({ "state": state, "error": "invalid address" });
-        };
-        let Some(spk) = BtcIndex::script_pubkey_for(a) else {
-            return json!({ "state": state, "error": "invalid address" });
-        };
-        names.push(a);
-        spks.push(spk);
-    }
-    match used.contains_batch(&spks) {
-        Ok(flags) => {
-            let hits: Vec<&str> = names.iter().zip(flags).filter(|(_, u)| *u).map(|(a, _)| *a).collect();
-            json!({ "state": "live", "used": hits })
-        }
-        Err(e) => {
-            error!("used_batch read failed: {:?}", e);
-            json!({ "state": state, "error": "index read failed" })
-        }
     }
 }
 
@@ -974,7 +890,7 @@ fn txid_display_hex(txid: &[u8; 32]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::btc_index::store::UtxoRecord;
     use std::path::PathBuf;
@@ -1016,17 +932,16 @@ mod tests {
     }
 
     fn ready_at(prune_height: u32) -> (Ready, Vec<PathBuf>) {
-        let (index_path, used_path, history_path) = (temp_path("index"), temp_path("used"), temp_path("history"));
+        let (index_path, history_path) = (temp_path("index"), temp_path("history"));
         let idx = BtcIndex::open(index_path.to_str().unwrap()).unwrap();
-        let used = UsedSet::open(used_path.to_str().unwrap()).unwrap();
         let history = HistoryIndex::open(history_path.to_str().unwrap()).unwrap();
         let (blocks, _) = broadcast::channel(16);
         let (txs, _) = broadcast::channel(16);
         let watch_state = WatchState::new(idx.clone());
         let (_prune_tx, prune_rx) = watch::channel(prune_height);
         (
-            Ready { idx, used, history, prune_rx, blocks, txs, watch_state },
-            vec![index_path, used_path, history_path],
+            Ready { idx, history, prune_rx, blocks, txs, watch_state },
+            vec![index_path, history_path],
         )
     }
 
@@ -1153,15 +1068,15 @@ mod tests {
         format!("http://{}", addr)
     }
 
-    fn ok(result: Value) -> Option<Value> {
+    pub(crate) fn ok(result: Value) -> Option<Value> {
         Some(json!({ "result": result, "error": null, "id": "relay" }))
     }
 
-    fn err(code: i64, message: &str) -> Option<Value> {
+    pub(crate) fn err(code: i64, message: &str) -> Option<Value> {
         Some(json!({ "result": null, "error": { "code": code, "message": message }, "id": "relay" }))
     }
 
-    async fn fake_node<F>(reply: F) -> String
+    pub(crate) async fn fake_node<F>(reply: F) -> String
     where
         F: Fn(&str, &Value) -> Option<Value> + Send + Sync + 'static,
     {
@@ -1457,7 +1372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_scan_asks_the_node_about_unwatched_coins() {
+    async fn an_unwatched_address_is_asked_of_the_node() {
         let (state_tx, state_rx, _node_tx, node_rx) = states();
         state_tx.send_replace(IndexState::Live);
         let (ready, paths) = ready();
@@ -1478,22 +1393,20 @@ mod tests {
         })
         .await;
         let rpc = BtcRpc::for_test(&url);
-        let req = json!({ "method": "utxos_batch", "addresses": [ADDR2, ADDR] });
+        let req = json!({ "method": "utxos", "address": ADDR2 });
         let resp = answer(&req, Some(&ready), &state_rx, &node_rx, &rpc).await;
-        let wallets = resp["wallets"].as_array().unwrap();
-        assert_eq!(wallets.len(), 1, "{resp}");
-        let coins = wallets[0]["utxos"].as_array().unwrap();
-        assert_eq!(coins.len(), 2);
+        let coins = resp["utxos"].as_array().unwrap();
+        assert_eq!(coins.len(), 2, "{resp}");
         let by_vout = |v: u64| coins.iter().find(|c| c["vout"] == v).unwrap().clone();
         assert_eq!(by_vout(0)["spent_by"], TXID);
         assert!(by_vout(2).get("spent_by").is_none());
         let dead = BtcRpc::for_test(&refused_url().await);
         let resp = answer(&req, Some(&ready), &state_rx, &node_rx, &dead).await;
         assert_eq!(resp["error"], "node error during utxo check", "{resp}");
-        assert!(resp.get("wallets").is_none());
-        let empty = json!({ "method": "utxos_batch", "addresses": [ADDR] });
+        assert!(resp.get("utxos").is_none());
+        let empty = json!({ "method": "utxos", "address": ADDR });
         let resp = answer(&empty, Some(&ready), &state_rx, &node_rx, &dead).await;
-        assert_eq!(resp["wallets"], json!([]), "{resp}");
+        assert_eq!(resp["utxos"], json!([]), "an address with no coins asks the node nothing: {resp}");
         cleanup(paths);
     }
 

@@ -102,6 +102,12 @@ impl WatchState {
         self.spent_by.remove_if(key, |_, spender| spender == txid);
     }
 
+    fn consumed(&self, key: &str) -> Option<(String, u64)> {
+        let spender = self.spender_of(key)?;
+        let entries = self.untracked_by.get(&spender)?;
+        entries.iter().find(|(k, _, _)| k == key).map(|(_, address, sats)| (address.clone(), *sats))
+    }
+
     pub fn track(&self, key: String, address: &str, sats: u64) {
         let previous = self.tracker.insert(key.clone(), (address.to_string(), sats));
         if let Some((old_address, _)) = previous
@@ -142,12 +148,16 @@ impl WatchState {
             self.spks.insert(spk);
         }
         self.seed(address);
+        self.enrich_later(address);
+        debug!("watching {} ({} tracked outpoints total)", address, self.tracker.len());
+    }
+
+    fn enrich_later(&self, address: &str) {
         if let Some(ctx) = &self.enrich
             && self.queued.insert(address.to_string())
         {
             let _ = ctx.backlog.send(address.to_string());
         }
-        debug!("watching {} ({} tracked outpoints total)", address, self.tracker.len());
     }
 
     pub fn unwatch(&self, address: &str) {
@@ -188,17 +198,16 @@ impl WatchState {
         };
         match self.idx.utxos_for_spk(&spk) {
             Ok(records) => {
-                let mut seeded = Vec::with_capacity(records.len());
                 for rec in records {
-                    let k = key(&rec.txid, rec.vout);
-                    self.track(k.clone(), address, rec.sats);
-                    seeded.push(k);
+                    self.track(key(&rec.txid, rec.vout), address, rec.sats);
                 }
                 // Read again, a block may have spent one in between.
                 match self.idx.utxos_for_spk(&spk) {
                     Ok(now) => {
                         let present: HashSet<String> = now.iter().map(|rec| key(&rec.txid, rec.vout)).collect();
-                        for k in spent_since(&seeded, &present, |txid| self.mempool.contains(txid)) {
+                        // Every tracked coin is judged, so a reorg leaves no coin of a transaction that is gone.
+                        let held: Vec<String> = self.by_address.get(address).map(|keys| keys.iter().cloned().collect()).unwrap_or_default();
+                        for k in spent_since(&held, &present, |txid| self.mempool.contains(txid)) {
                             self.untrack(&k);
                         }
                     }
@@ -212,6 +221,8 @@ impl WatchState {
     pub fn reseed_all(&self) {
         for addr in self.addresses.iter() {
             self.seed(&addr);
+            // A spend a reorg returned to the mempool can touch nothing watched until now.
+            self.enrich_later(&addr);
         }
         info!("tracker reseeded for {} watched addresses", self.addresses.len());
     }
@@ -426,14 +437,18 @@ async fn resolve_input(
     vout: u32,
 ) -> (String, Option<String>, Option<u64>) {
     let key = format!("{}:{}", prev_txid, vout);
-    let tracked = state.tracker.get(&key).map(|entry| entry.value().clone());
+    let tracked = state.tracker.get(&key).map(|entry| entry.value().clone()).or_else(|| state.consumed(&key));
     if let Some((address, sats)) = tracked {
         return (key, Some(address), Some(sats));
     }
     match rpc.call("gettxout", json!([prev_txid, vout, false])).await {
         Ok(out) if !out.is_null() => (
             key,
-            out["scriptPubKey"]["address"].as_str().map(|s| s.to_string()),
+            out["scriptPubKey"]["hex"]
+                .as_str()
+                .and_then(|h| crate::btc_index::sync::hex_decode(h).ok())
+                .and_then(|spk| Address::from_script(&spk))
+                .map(|a| a.to_string()),
             out["value"].as_f64().map(|v| (v * 1e8).round() as u64),
         ),
         _ => (key, None, None),
@@ -496,12 +511,16 @@ async fn build_mempool_frame(
         if let Some(a) = address.as_deref()
             && state.addresses.contains(a)
         {
-            state.track(format!("{}:{}", txid, vout), a, sats);
+            let key = format!("{}:{}", txid, vout);
+            // A parent framed again must not free a coin its child already spends.
+            if state.spender_of(&key).is_none() {
+                state.track(key, a, sats);
+            }
         }
         outputs.push(json!({ "address": address, "sats": sats, "vout": vout }));
     }
 
-    let (fees, vsize) = match rpc.call("getmempoolentry", json!([txid])).await {
+    let (fees, vsize, time) = match rpc.call("getmempoolentry", json!([txid])).await {
         Ok(entry) => (
             entry["fees"]["base"]
                 .as_f64()
@@ -509,8 +528,9 @@ async fn build_mempool_frame(
                 .unwrap_or_else(|| "0".to_string()),
             // vsize deprecated in version 32
             entry["vsize_bip141"].as_u64().or_else(|| entry["vsize"].as_u64()),
+            entry["time"].as_u64(),
         ),
-        Err(_) => ("0".to_string(), None),
+        Err(_) => ("0".to_string(), None, None),
     };
 
     json!({
@@ -518,6 +538,7 @@ async fn build_mempool_frame(
         "txid": txid,
         "fees": fees,
         "vsize": vsize,
+        "time": time,
         "inputs": inputs,
         "outputs": outputs
     })
@@ -546,13 +567,20 @@ async fn undo_dropped_tx(state: &WatchState, rpc: &BtcRpc, txid: &str) {
         state.unmark_spent(&key, txid);
         let Some((prev_txid, vout)) = key.split_once(':') else { continue };
         let Ok(vout) = vout.parse::<u32>() else { continue };
-        match rpc.call("gettxout", json!([prev_txid, vout, true])).await {
-            Ok(out) if !out.is_null() => {
-                debug!("drop {}: restoring input {} to {}", txid, key, address);
-                state.track(key.clone(), &address, sats);
+        let held = match rpc.call("gettxout", json!([prev_txid, vout, true])).await {
+            Ok(out) if !out.is_null() => true,
+            Ok(_) if state.spender_of(&key).is_some() => false,
+            // A replacement hides the coin from the mempool view, so the mirror and the chain vouch for it.
+            Ok(_) if state.mempool.contains(prev_txid) => true,
+            Ok(_) => matches!(rpc.call("gettxout", json!([prev_txid, vout, false])).await, Ok(out) if !out.is_null()),
+            Err(e) => {
+                warn!("drop {}: gettxout {} failed, leaving untracked: {:?}", txid, key, e);
+                false
             }
-            Ok(_) => {}
-            Err(e) => warn!("drop {}: gettxout {} failed, leaving untracked: {:?}", txid, key, e),
+        };
+        if held {
+            debug!("drop {}: restoring input {} to {}", txid, key, address);
+            state.track(key.clone(), &address, sats);
         }
     }
 }
@@ -616,6 +644,8 @@ async fn enrich_watch(state: &WatchState, rpc: &BtcRpc, txs: &broadcast::Sender<
         }
         for txid in parents_first(state, &pending) {
             done.insert(txid.clone());
+            // A drop is reported only for a transaction in this set.
+            state.seen.insert(txid.clone());
             let Ok(hex) = rpc.call("getrawtransaction", json!([txid])).await else {
                 debug!("enrichment tx {} gone from mempool mid-task", txid);
                 continue;
@@ -660,15 +690,20 @@ pub fn spawn_block_consumer(state: WatchState, mut blocks: broadcast::Receiver<S
 }
 
 fn evict_confirmed_from_mempool_index(state: &WatchState, event: &Value) {
-    for change in event["changes"].as_array().into_iter().flatten() {
-        for rec in change["created"].as_array().into_iter().flatten() {
-            if let Some(txid) = rec["txid"].as_str() {
-                state.mempool.evict(txid);
-                if let Some((_, entries)) = state.untracked_by.remove(txid) {
-                    for (key, _, _) in entries {
-                        state.unmark_spent(&key, txid);
-                    }
-                }
+    let paying = event["changes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|change| change["created"].as_array().into_iter().flatten())
+        .filter_map(|rec| rec["txid"].as_str());
+    let watched = event["txids"].as_array().into_iter().flatten().filter_map(|t| t.as_str());
+    for txid in paying.chain(watched) {
+        state.mempool.evict(txid);
+        // framed again after reorg.
+        state.seen.remove(txid);
+        if let Some((_, entries)) = state.untracked_by.remove(txid) {
+            for (key, _, _) in entries {
+                state.unmark_spent(&key, txid);
             }
         }
     }
@@ -1019,12 +1054,20 @@ mod tests {
 
         s.untracked_by.insert("t4".to_string(), vec![("cc:0".to_string(), A.to_string(), 5)]);
         s.mark_spent("cc:0", "t4");
+        s.seen.insert("t4".to_string());
         evict_confirmed_from_mempool_index(
             &s,
-            &json!({ "changes": [{ "address": A, "created": [{ "txid": "t4", "vout": 0, "sats": 1 }], "spent": [] }] }),
+            &json!({ "txids": ["t4"], "changes": [] }),
         );
         assert_eq!(s.spender_of("cc:0"), None);
+        s.mempool.insert_live("t5", vec![vec![0x00, 0x14, 2]], vec![]);
+        evict_confirmed_from_mempool_index(
+            &s,
+            &json!({ "changes": [{ "address": A, "created": [{ "txid": "t5", "vout": 0, "sats": 1 }], "spent": [] }] }),
+        );
+        assert!(!s.mempool.contains("t5"), "a block's transactions leave the mirror whoever they pay");
         assert!(!s.untracked_by.contains_key("t4"));
+        assert!(!s.seen.contains("t4"), "a confirmed transaction can be framed again after a reorg");
 
         s.addresses.insert(A.to_string());
         s.track("bb:1".to_string(), A, 10);
@@ -1036,6 +1079,131 @@ mod tests {
         assert_eq!(s.spender_of("bb:1"), None);
         assert!(!s.tracker.contains_key("bb:1"));
         assert_consistent(&s);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn paying(prev: dannesk_btc_codec::tx::OutPoint, sats: u64) -> Transaction {
+        use dannesk_btc_codec::tx::{SEQUENCE_FINAL, TxIn, TxOut};
+        Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![TxIn { previous_output: prev, script_sig: vec![], sequence: SEQUENCE_FINAL, witness: vec![] }],
+            output: vec![TxOut { value: sats, script_pubkey: BtcIndex::script_pubkey_for(A).unwrap() }],
+        }
+    }
+
+    async fn gone_coin_node() -> BtcRpc {
+        use crate::server::tests::{err, fake_node, ok};
+        let url = fake_node(|method, _| match method {
+            "gettxout" => ok(Value::Null),
+            "getmempoolentry" => ok(json!({ "vsize_bip141": 110, "fees": { "base": 0.00001 } })),
+            _ => err(-32601, "Method not found"),
+        })
+        .await;
+        BtcRpc::for_test(&url)
+    }
+
+    #[test]
+    fn a_reseed_leaves_no_coin_of_a_transaction_that_is_gone() {
+        let (s, path) = watch_state();
+        s.watch(A);
+        s.track("dead:1".to_string(), A, 5);
+        s.track("live:1".to_string(), A, 6);
+        s.mempool.insert_live("live", vec![vec![0x00, 0x14, 1]], vec![]);
+        s.reseed_all();
+        assert!(!s.tracker.contains_key("dead:1"), "out of the chain and out of the mempool");
+        assert!(s.tracker.contains_key("live:1"), "a pending coin stays");
+        assert_consistent(&s);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_bump_over_a_pending_leftover_keeps_the_coin_spent() {
+        use dannesk_btc_codec::tx::{OutPoint, Txid};
+        let rpc = gone_coin_node().await;
+        let (s, path) = watch_state();
+        s.watch(A);
+        let parent = paying(OutPoint { txid: Txid::from_bytes([0xaa; 32]), vout: 0 }, 9_000);
+        let parent_txid = parent.txid().to_string();
+        s.mempool.insert_live(&parent_txid, mempool::output_spks(&parent), mempool::input_prevouts(&parent));
+        build_mempool_frame(&s, &rpc, &parent, &parent_txid).await;
+        let key = format!("{parent_txid}:0");
+        let leftover = OutPoint { txid: parent.txid(), vout: 0 };
+        let child = paying(leftover.clone(), 8_000);
+        let child_txid = child.txid().to_string();
+        build_mempool_frame(&s, &rpc, &child, &child_txid).await;
+        assert_eq!(s.spender_of(&key).as_deref(), Some(child_txid.as_str()));
+        build_mempool_frame(&s, &rpc, &parent, &parent_txid).await;
+        assert!(!s.tracker.contains_key(&key), "framing the parent again leaves the coin spent");
+
+        // node reports the replaced transaction first.
+        undo_dropped_tx(&s, &rpc, &child_txid).await;
+        assert!(s.tracker.contains_key(&key), "the replacement's input stays ours to name");
+        let bump = paying(leftover.clone(), 7_000);
+        let bump_txid = bump.txid().to_string();
+        let frame: Value = serde_json::from_str(&build_mempool_frame(&s, &rpc, &bump, &bump_txid).await).unwrap();
+        assert_eq!(frame["inputs"][0]["address"], A);
+        assert_eq!(s.spender_of(&key).as_deref(), Some(bump_txid.as_str()));
+        assert!(!s.tracker.contains_key(&key));
+
+        // a second bump framed before its original's drop.
+        let again = paying(leftover, 6_000);
+        let again_txid = again.txid().to_string();
+        let frame: Value = serde_json::from_str(&build_mempool_frame(&s, &rpc, &again, &again_txid).await).unwrap();
+        assert_eq!(frame["inputs"][0]["address"], A);
+        undo_dropped_tx(&s, &rpc, &bump_txid).await;
+        assert_eq!(s.spender_of(&key).as_deref(), Some(again_txid.as_str()));
+        assert!(!s.tracker.contains_key(&key), "a coin the replacement spends is not free again");
+        assert_consistent(&s);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_frame_carries_the_time_the_node_first_saw_it() {
+        use crate::server::tests::{err, fake_node, ok};
+        use dannesk_btc_codec::tx::{OutPoint, Txid};
+        let tx = paying(OutPoint { txid: Txid::from_bytes([0xcc; 32]), vout: 0 }, 9_000);
+        let txid = tx.txid().to_string();
+        let (s, path) = watch_state();
+        s.watch(A);
+        let in_mempool = fake_node(|method, _| match method {
+            "gettxout" => ok(Value::Null),
+            "getmempoolentry" => ok(json!({ "vsize_bip141": 110, "fees": { "base": 0.00001 }, "time": 1_793_427_635u64 })),
+            _ => err(-32601, "Method not found"),
+        })
+        .await;
+        let frame: Value = serde_json::from_str(&build_mempool_frame(&s, &BtcRpc::for_test(&in_mempool), &tx, &txid).await).unwrap();
+        assert_eq!(frame["time"], 1_793_427_635u64);
+        let gone = fake_node(|method, _| match method {
+            "gettxout" => ok(Value::Null),
+            _ => err(-5, "Transaction not in mempool"),
+        })
+        .await;
+        let frame: Value = serde_json::from_str(&build_mempool_frame(&s, &BtcRpc::for_test(&gone), &tx, &txid).await).unwrap();
+        assert!(frame["time"].is_null(), "a transaction out of the mempool has no first-seen time to give");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_watch_time_match_can_be_reported_dropped() {
+        use crate::server::tests::{err, fake_node, ok};
+        use dannesk_btc_codec::tx::{OutPoint, Txid};
+        let tx = paying(OutPoint { txid: Txid::from_bytes([0xbb; 32]), vout: 0 }, 9_000);
+        let (txid, hex) = (tx.txid().to_string(), tx.to_hex());
+        let url = fake_node(move |method, _| match method {
+            "getrawtransaction" => ok(json!(hex)),
+            "gettxout" => ok(Value::Null),
+            "getmempoolentry" => ok(json!({ "vsize_bip141": 110, "fees": { "base": 0.00001 } })),
+            _ => err(-32601, "Method not found"),
+        })
+        .await;
+        let (s, path) = watch_state();
+        s.watch(A);
+        s.mempool.insert_live(&txid, mempool::output_spks(&tx), mempool::input_prevouts(&tx));
+        let (txs, mut frames) = broadcast::channel::<String>(4);
+        enrich_watch(&s, &BtcRpc::for_test(&url), &txs, A).await;
+        assert!(frames.try_recv().is_ok());
+        assert!(s.seen.contains(&txid));
         let _ = std::fs::remove_file(path);
     }
 }

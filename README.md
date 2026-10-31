@@ -7,7 +7,6 @@
 An async Bitcoin address index for a pruned Bitcoin Core node.
 
 - Balances and unspent outputs for any mainnet address
-- Used-address lookup for wallet restores
 - Address history within the node's prune window
 - Mempool and block events for watched addresses
 - Transaction broadcast

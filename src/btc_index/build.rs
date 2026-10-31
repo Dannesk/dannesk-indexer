@@ -8,6 +8,7 @@ use super::store::{META, META_TIP, UTXOS, UtxoRecord};
 
 const SNAPSHOT_MAGIC: [u8; 5] = *b"utxo\xff";
 const MAINNET_MAGIC: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xd9];
+const REGTEST_MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda];
 const COMMIT_EVERY: u64 = 1_000_000;
 
 pub fn run(dump_path: &str, store_path: &str) -> Result<()> {
@@ -25,8 +26,11 @@ pub fn run(dump_path: &str, store_path: &str) -> Result<()> {
         bail!("Unsupported snapshot version {} (expected 2)", version);
     }
     let net: [u8; 4] = read_array(&mut r)?;
-    if net != MAINNET_MAGIC {
-        bail!("Snapshot is not mainnet (network magic {:02x?})", net);
+    if net != MAINNET_MAGIC && net != REGTEST_MAGIC {
+        bail!("Snapshot is neither mainnet nor regtest (network magic {:02x?})", net);
+    }
+    if net == REGTEST_MAGIC {
+        println!("regtest snapshot");
     }
     let base_hash: [u8; 32] = read_array(&mut r)?;
     let coin_count = u64::from_le_bytes(read_array(&mut r)?);

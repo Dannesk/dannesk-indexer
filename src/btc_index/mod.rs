@@ -5,7 +5,6 @@ pub mod history;
 pub mod repair;
 pub mod store;
 pub mod sync;
-pub mod used;
 
 use anyhow::{Context, Result};
 use dannesk_btc_codec::address::Address;

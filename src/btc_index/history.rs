@@ -13,7 +13,6 @@ use tracing::{debug, error, info, warn};
 use super::IndexState;
 use super::store::UNDO_DEPTH;
 use super::sync::{hex_decode, txid_bytes};
-use super::used::is_address_script;
 use crate::rpc::BtcRpc;
 
 pub const EPOCH: u32 = 144;
@@ -37,6 +36,16 @@ const GETBLOCK_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct Entry {
     pub spk: Vec<u8>,
     pub txid: [u8; 32],
+}
+
+fn is_address_script(spk: &[u8]) -> bool {
+    match spk.len() {
+        22 => spk[0] == 0x00 && spk[1] == 0x14,
+        34 => spk[0] == 0x51 && spk[1] == 0x20,
+        25 => spk[0] == 0x76 && spk[1] == 0xa9 && spk[2] == 0x14 && spk[23] == 0x88 && spk[24] == 0xac,
+        23 => spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -415,6 +424,10 @@ impl HistoryIndex {
                         }
                     }
                 }
+                // Days run newest first, so a whole day past the limit leaves nothing newer to find.
+                if found.len() > limit {
+                    break;
+                }
             }
         }
         let mut transactions: Vec<(u32, [u8; 32])> = found.into_iter().map(|(t, h)| (h, t)).collect();
@@ -713,6 +726,48 @@ mod tests {
         assert_eq!(epoch_of("hist_6539"), Some(6539));
         assert_eq!(epoch_of("meta"), None);
         assert_eq!(day_name(941_744), "hist_6539");
+    }
+
+    #[test]
+    fn only_the_four_address_templates_count() {
+        let script = |hex: &str| -> Vec<u8> {
+            (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+        };
+        let h20 = "00".repeat(20);
+        let h32 = "11".repeat(32);
+        assert!(is_address_script(&script(&format!("0014{h20}"))));
+        assert!(is_address_script(&script(&format!("5120{h32}"))));
+        assert!(is_address_script(&script(&format!("76a914{h20}88ac"))));
+        assert!(is_address_script(&script(&format!("a914{h20}87"))));
+        assert!(!is_address_script(&script(&format!("0020{h32}"))));
+        assert!(!is_address_script(&script("6a0474657374")));
+        assert!(!is_address_script(&script(&format!("76a914{h20}88ad"))));
+        assert!(!is_address_script(&[]));
+        assert!(!is_address_script(&script("0014")));
+    }
+
+    #[test]
+    fn the_newest_rows_are_whole_when_the_walk_stops_early() {
+        let (hist, path) = temp();
+        let at = |day: u32, n: u32| day * EPOCH + n;
+        let entries: Vec<(Vec<u8>, u32, [u8; 32])> = vec![
+            (spk(1), at(0, 1), [1; 32]),
+            (spk(1), at(1, 1), [2; 32]),
+            (spk(1), at(2, 1), [3; 32]),
+            (spk(1), at(2, 2), [4; 32]),
+            (spk(1), at(2, 3), [5; 32]),
+        ];
+        hist.seed_for_test(at(0, 0), at(2, 9), &entries).unwrap();
+        let h = hist.history(&[spk(1)], 0, 2).unwrap().unwrap();
+        assert_eq!(txids(&h), vec![(at(2, 3), 5), (at(2, 2), 4)]);
+        assert!(h.truncated);
+        let h = hist.history(&[spk(1)], 0, 4).unwrap().unwrap();
+        assert_eq!(txids(&h), vec![(at(2, 3), 5), (at(2, 2), 4), (at(2, 1), 3), (at(1, 1), 2)]);
+        assert!(h.truncated);
+        let h = hist.history(&[spk(1)], 0, 5).unwrap().unwrap();
+        assert_eq!(h.transactions.len(), 5);
+        assert!(!h.truncated);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

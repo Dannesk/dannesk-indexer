@@ -46,7 +46,8 @@ pub struct BtcRpc {
 }
 
 impl BtcRpc {
-    pub fn from_env(url: &str) -> Result<Self> {
+    pub fn from_env(default_url: &str) -> Result<Self> {
+        let url = std::env::var("BTC_RPC_URL").unwrap_or_else(|_| default_url.to_string());
         let user = std::env::var("BTC_RPC_USER")
             .context("BTC_RPC_USER not set (prod: /etc/indexd.env via EnvironmentFile)")?;
         let pass = std::env::var("BTC_RPC_PASS")
@@ -57,7 +58,7 @@ impl BtcRpc {
             .context("Failed to build Bitcoin RPC client")?;
         Ok(Self {
             client,
-            url: url.to_string(),
+            url,
             user,
             pass,
             slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),

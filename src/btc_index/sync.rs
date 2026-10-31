@@ -13,14 +13,15 @@ use zeromq::{Socket, SocketRecv, SubSocket};
 
 use super::store::{META, META_TIP, UNDO, UNDO_DEPTH, UTXOS, UndoRow, UtxoRecord};
 use super::history::{self, HistoryBlock, HistoryIndex};
-use super::used::{self, AppliedBlock, UsedSet};
 use super::{BtcIndex, IndexState};
-use crate::rpc::BtcRpc;
+use crate::rpc::{BtcRpc, NodeError};
 
 const GETBLOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_FALLBACK: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const QUIET_RETRIES: Duration = Duration::from_secs(600);
+const RPC_OUT_OF_RANGE: i64 = -8;
+const MAX_SHRINKS: u32 = 100;
 
 #[derive(Clone)]
 pub struct SyncEvents {
@@ -32,7 +33,6 @@ pub struct SyncEvents {
 
 pub fn spawn(
     idx: BtcIndex,
-    used: UsedSet,
     hist: HistoryIndex,
     rpc: BtcRpc,
     zmq_endpoint: String,
@@ -40,12 +40,11 @@ pub fn spawn(
     events: SyncEvents,
 ) {
     let _ = state_tx.send(idx.state());
-    tokio::spawn(run(idx, used, hist, rpc, zmq_endpoint, state_tx, events));
+    tokio::spawn(run(idx, hist, rpc, zmq_endpoint, state_tx, events));
 }
 
 async fn run(
     idx: BtcIndex,
-    used: UsedSet,
     hist: HistoryIndex,
     rpc: BtcRpc,
     zmq_endpoint: String,
@@ -60,7 +59,7 @@ async fn run(
 
     let mut quiet_until: Option<tokio::time::Instant> = None;
     loop {
-        if let Err(e) = cycle(&idx, &used, &hist, &rpc, &zmq_endpoint, &state_tx, &events).await {
+        if let Err(e) = cycle(&idx, &hist, &rpc, &zmq_endpoint, &state_tx, &events).await {
             let _ = state_tx.send(IndexState::CatchingUp);
             let now = tokio::time::Instant::now();
             if quiet_until.is_none_or(|t| now >= t) {
@@ -76,7 +75,6 @@ async fn run(
 
 async fn cycle(
     idx: &BtcIndex,
-    used: &UsedSet,
     hist: &HistoryIndex,
     rpc: &BtcRpc,
     zmq_endpoint: &str,
@@ -84,7 +82,7 @@ async fn cycle(
     events: &SyncEvents,
 ) -> Result<()> {
     let _ = state_tx.send(IndexState::CatchingUp);
-    converge(idx, used, hist, rpc, events).await?;
+    converge(idx, hist, rpc, events).await?;
     let (h, _) = idx.tip()?.context("tip vanished")?;
     let _ = state_tx.send(IndexState::Live);
     info!("btc_index LIVE at height {}", h);
@@ -107,65 +105,93 @@ async fn cycle(
                 debug!("btc_index poll fallback tick");
             }
         }
-        converge(idx, used, hist, rpc, events).await?;
+        converge(idx, hist, rpc, events).await?;
     }
 }
 
 async fn converge(
     idx: &BtcIndex,
-    used: &UsedSet,
     hist: &HistoryIndex,
     rpc: &BtcRpc,
     events: &SyncEvents,
 ) -> Result<()> {
-    {
-        let (our_h, _) = idx.tip()?.context("index has no tip")?;
-        used::catch_up(used, rpc, our_h).await?;
-        history::catch_up(hist, rpc, our_h).await?;
-    }
+    let mut caught_up = false;
+    let mut shrank = 0u32;
     loop {
-        let (our_h, our_hash) = idx.tip()?.context("index has no tip")?;
-        let node_h = rpc
-            .call("getblockcount", json!([]))
-            .await?
-            .as_u64()
-            .context("getblockcount: not a number")? as u32;
-
-        if node_h < our_h {
-            rewind_one(idx, used, hist, &events.blocks)?;
-            continue;
-        }
-        let node_hash_at_ours =
-            hash_from_rpc(&rpc.call("getblockhash", json!([our_h])).await?)?;
-        if node_hash_at_ours != our_hash {
-            warn!("btc_index reorg detected at height {}, rewinding", our_h);
-            rewind_one(idx, used, hist, &events.blocks)?;
-            continue;
-        }
-        if our_h == node_h {
-            return Ok(());
-        }
-
-        let next_hash = rpc.call("getblockhash", json!([our_h + 1])).await?;
-        let next_hash = next_hash.as_str().context("getblockhash: not a string")?;
-        let block = rpc
-            .call_with_timeout("getblock", json!([next_hash, 3]), GETBLOCK_TIMEOUT)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "getblock {} failed — if pruned away, rebuild the index from a fresh dump: {:?}",
-                    next_hash,
-                    e
-                )
-            })?;
-        apply_block(idx, used, hist, &block, events)?;
-        let applied = our_h + 1;
-        if node_h - applied >= 3 && applied % 10 == 0 {
-            info!("btc_index catching up: {}/{}", applied, node_h);
-        } else if node_h - applied < 3 {
-            debug!("btc_index at {}/{}", applied, node_h);
+        match step(idx, hist, rpc, events, &mut caught_up).await {
+            Ok(Step::Done) => return Ok(()),
+            Ok(Step::Again) => {}
+            // The node's chain shrank between two calls, as in a reorg, so the tip is read again.
+            Err(e) if height_gone(&e) && shrank < MAX_SHRINKS => shrank += 1,
+            Err(e) => return Err(e),
         }
     }
+}
+
+enum Step {
+    Again,
+    Done,
+}
+
+fn height_gone(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<NodeError>().is_some_and(|NodeError(err)| err["code"].as_i64() == Some(RPC_OUT_OF_RANGE))
+    })
+}
+
+async fn step(
+    idx: &BtcIndex,
+    hist: &HistoryIndex,
+    rpc: &BtcRpc,
+    events: &SyncEvents,
+    caught_up: &mut bool,
+) -> Result<Step> {
+    let (our_h, our_hash) = idx.tip()?.context("index has no tip")?;
+    let node_h = rpc
+        .call("getblockcount", json!([]))
+        .await?
+        .as_u64()
+        .context("getblockcount: not a number")? as u32;
+
+    if node_h < our_h {
+        rewind_one(idx, hist, &events.blocks)?;
+        return Ok(Step::Again);
+    }
+    let node_hash_at_ours = hash_from_rpc(&rpc.call("getblockhash", json!([our_h])).await?)?;
+    if node_hash_at_ours != our_hash {
+        warn!("btc_index reorg detected at height {}, rewinding", our_h);
+        rewind_one(idx, hist, &events.blocks)?;
+        return Ok(Step::Again);
+    }
+    // Only when the tip is on the node's chain, so the history index never asks for a block the node lost.
+    if !*caught_up {
+        history::catch_up(hist, rpc, our_h).await?;
+        *caught_up = true;
+    }
+    if our_h == node_h {
+        return Ok(Step::Done);
+    }
+
+    let next_hash = rpc.call("getblockhash", json!([our_h + 1])).await?;
+    let next_hash = next_hash.as_str().context("getblockhash: not a string")?;
+    let block = rpc
+        .call_with_timeout("getblock", json!([next_hash, 3]), GETBLOCK_TIMEOUT)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "getblock {} failed — if pruned away, rebuild the index from a fresh dump: {:?}",
+                next_hash,
+                e
+            )
+        })?;
+    apply_block(idx, hist, &block, events)?;
+    let applied = our_h + 1;
+    if node_h - applied >= 3 && applied % 10 == 0 {
+        info!("btc_index catching up: {}/{}", applied, node_h);
+    } else if node_h - applied < 3 {
+        debug!("btc_index at {}/{}", applied, node_h);
+    }
+    Ok(Step::Again)
 }
 
 struct WatchedTx {
@@ -175,7 +201,7 @@ struct WatchedTx {
     created: Range<usize>,
 }
 
-fn apply_block(idx: &BtcIndex, used: &UsedSet, hist: &HistoryIndex, block: &Value, events: &SyncEvents) -> Result<()> {
+fn apply_block(idx: &BtcIndex, hist: &HistoryIndex, block: &Value, events: &SyncEvents) -> Result<()> {
     let height = block["height"].as_u64().context("block: no height")? as u32;
     let this_hash = txid_bytes(block["hash"].as_str().context("block: no hash")?)?;
     let prev_hash = txid_bytes(
@@ -267,17 +293,12 @@ fn apply_block(idx: &BtcIndex, used: &UsedSet, hist: &HistoryIndex, block: &Valu
         hist_block.push_tx(txid, tx_spks);
     }
 
-    let event = block_event(height, block["hash"].as_str().unwrap_or_default(), &spent, &created);
+    let event = block_event(height, block["hash"].as_str().unwrap_or_default(), &spent, &created, &watched_txs);
     let blocktime = block["time"].as_u64().unwrap_or(0);
     let tx_frames: Vec<String> = watched_txs
         .iter()
         .map(|w| confirmed_tx_frame(w, height, blocktime, &spent, &created))
         .collect();
-
-    let mut used_scripts: Vec<Vec<u8>> =
-        created.iter().map(|(spk, _)| spk).filter(|s| used::is_address_script(s)).cloned().collect();
-    used_scripts.sort_unstable();
-    used_scripts.dedup();
 
     let write = idx.db.begin_write()?;
     let (mut spends_not_indexed, mut spends_missing) = (0u32, 0u32);
@@ -334,9 +355,6 @@ fn apply_block(idx: &BtcIndex, used: &UsedSet, hist: &HistoryIndex, block: &Valu
         meta.insert(META_TIP, tip_bytes(height, &this_hash).as_slice())?;
     }
     write.commit()?;
-    if used.cursor()?.is_some() {
-        used.apply(&[AppliedBlock { height, hash: this_hash, prev: prev_hash, scripts: used_scripts }])?;
-    }
     hist.apply(&hist_block)?;
     let _ = events.blocks.send(event);
     let confirmed = tx_frames.len();
@@ -400,6 +418,7 @@ fn block_event(
     hash_display: &str,
     spent: &[(Vec<u8>, UtxoRecord)],
     created: &[(Vec<u8>, UtxoRecord)],
+    watched: &[WatchedTx],
 ) -> String {
     fn rec_json(rec: &UtxoRecord) -> Value {
         json!({
@@ -423,13 +442,14 @@ fn block_event(
             json!({ "address": address, "created": created, "spent": spent })
         })
         .collect();
-    json!({ "type": "block", "height": height, "hash": hash_display, "changes": changes })
+    let txids: Vec<&str> = watched.iter().map(|w| w.txid.as_str()).collect();
+    json!({ "type": "block", "height": height, "hash": hash_display, "changes": changes, "txids": txids })
         .to_string()
 }
 
-fn rewind_one(idx: &BtcIndex, used: &UsedSet, hist: &HistoryIndex, events: &broadcast::Sender<String>) -> Result<()> {
+fn rewind_one(idx: &BtcIndex, hist: &HistoryIndex, events: &broadcast::Sender<String>) -> Result<()> {
     let (h, our_hash) = idx.tip()?.context("index has no tip")?;
-    let prev_for_used: [u8; 32];
+    let prev_hash: [u8; 32];
     let write = idx.db.begin_write()?;
     {
         let mut undo = write.open_table(UNDO)?;
@@ -454,18 +474,13 @@ fn rewind_one(idx: &BtcIndex, used: &UsedSet, hist: &HistoryIndex, events: &broa
         }
         let mut meta = write.open_table(META)?;
         meta.insert(META_TIP, tip_bytes(h - 1, &row.prev_hash).as_slice())?;
-        prev_for_used = row.prev_hash;
+        prev_hash = row.prev_hash;
     }
     write.commit()?;
-    if let Some((uh, _)) = used.cursor()? {
-        if uh >= h {
-            used.set_cursor(h - 1, &prev_for_used)?;
-        }
-    }
     if let Some((hh, _)) = hist.cursor()?
         && hh >= h
     {
-        hist.rewind_to(h - 1, &prev_for_used)?;
+        hist.rewind_to(h - 1, &prev_hash)?;
     }
     let _ = events.send(json!({ "type": "reorg", "height": h }).to_string());
     info!("btc_index rewound block {}", h);
@@ -492,7 +507,7 @@ fn hash_from_rpc(v: &Value) -> Result<[u8; 32]> {
     txid_bytes(v.as_str().context("hash: not a string")?)
 }
 
-pub(super) fn hex_decode(s: &str) -> Result<Vec<u8>> {
+pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>> {
     if s.len() % 2 != 0 {
         bail!("odd-length hex");
     }
@@ -527,17 +542,6 @@ fn sats(v: &Value) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::btc_index::AddressBalance;
-
-    fn temp_used() -> UsedSet {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "btc-sync-used-{}-{}.redb",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_file(&path);
-        UsedSet::open(path.to_str().unwrap()).unwrap()
-    }
 
     fn temp_hist() -> HistoryIndex {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -659,7 +663,7 @@ mod tests {
         let spk_b = BtcIndex::script_pubkey_for(ADDR_B).unwrap();
         seed(&idx, &spk_a);
 
-        apply_block(&idx, &temp_used(), &temp_hist(), &block_101(&spk_a, &spk_b), &sinks(&[]).0).unwrap();
+        apply_block(&idx, &temp_hist(), &block_101(&spk_a, &spk_b), &sinks(&[]).0).unwrap();
 
         assert_eq!(idx.tip().unwrap(), Some((101, [2u8; 32])));
         assert_eq!(
@@ -671,9 +675,9 @@ mod tests {
             AddressBalance { sats: 312_530_000, utxo_count: 2 }
         );
 
-        assert!(apply_block(&idx, &temp_used(), &temp_hist(), &block_101(&spk_a, &spk_b), &sinks(&[]).0).is_err());
+        assert!(apply_block(&idx, &temp_hist(), &block_101(&spk_a, &spk_b), &sinks(&[]).0).is_err());
 
-        rewind_one(&idx, &temp_used(), &temp_hist(), &ev()).unwrap();
+        rewind_one(&idx, &temp_hist(), &ev()).unwrap();
         assert_eq!(idx.tip().unwrap(), Some((100, [1u8; 32])));
         assert_eq!(
             idx.query_spk(&spk_a).unwrap(),
@@ -684,11 +688,11 @@ mod tests {
             AddressBalance { sats: 0, utxo_count: 0 }
         );
 
-        apply_block(&idx, &temp_used(), &temp_hist(), &block_101(&spk_a, &spk_b), &sinks(&[]).0).unwrap();
+        apply_block(&idx, &temp_hist(), &block_101(&spk_a, &spk_b), &sinks(&[]).0).unwrap();
         assert_eq!(idx.tip().unwrap(), Some((101, [2u8; 32])));
 
-        rewind_one(&idx, &temp_used(), &temp_hist(), &ev()).unwrap();
-        assert!(rewind_one(&idx, &temp_used(), &temp_hist(), &ev()).is_err());
+        rewind_one(&idx, &temp_hist(), &ev()).unwrap();
+        assert!(rewind_one(&idx, &temp_hist(), &ev()).is_err());
 
         let _ = std::fs::remove_file(path);
     }
@@ -750,16 +754,16 @@ mod tests {
             );
         };
 
-        apply_block(&idx, &temp_used(), &temp_hist(), &block, &sinks(&[]).0).unwrap();
+        apply_block(&idx, &temp_hist(), &block, &sinks(&[]).0).unwrap();
         after(&idx);
-        rewind_one(&idx, &temp_used(), &temp_hist(), &ev()).unwrap();
+        rewind_one(&idx, &temp_hist(), &ev()).unwrap();
         before(&idx);
 
-        apply_block(&idx, &temp_used(), &temp_hist(), &block, &sinks(&[]).0).unwrap();
+        apply_block(&idx, &temp_hist(), &block, &sinks(&[]).0).unwrap();
         after(&idx);
         let left_over = UtxoRecord { txid: [0xBB; 32], vout: 1, sats: 19_000, height: 101 };
         idx.insert_for_test(&spk_a, &left_over).unwrap();
-        rewind_one(&idx, &temp_used(), &temp_hist(), &ev()).unwrap();
+        rewind_one(&idx, &temp_hist(), &ev()).unwrap();
         before(&idx);
 
         let _ = std::fs::remove_file(path);
@@ -796,7 +800,7 @@ mod tests {
             .replace("SB", &hex::encode_dummy(&spk_b));
         let mut unspent: Value = serde_json::from_str(&text).unwrap();
         unspent["tx"].as_array_mut().unwrap().pop();
-        apply_block(&idx, &temp_used(), &temp_hist(), &unspent, &sinks(&[]).0).unwrap();
+        apply_block(&idx, &temp_hist(), &unspent, &sinks(&[]).0).unwrap();
         let written = idx.utxos_for_spk(&spk_a).unwrap();
 
         let named =
@@ -815,7 +819,7 @@ mod tests {
         seed(&idx, &spk_a);
 
         let (events, mut rx) = sinks(&[&spk_b]);
-        apply_block(&idx, &temp_used(), &temp_hist(), &block_101(&spk_a, &spk_b), &events).unwrap();
+        apply_block(&idx, &temp_hist(), &block_101(&spk_a, &spk_b), &events).unwrap();
 
         let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|f| serde_json::from_str(&f).unwrap())
@@ -855,7 +859,7 @@ mod tests {
         seed(&idx, &spk_a);
 
         let (events, mut rx) = sinks(&[]);
-        apply_block(&idx, &temp_used(), &temp_hist(), &block_101(&spk_a, &spk_b), &events).unwrap();
+        apply_block(&idx, &temp_hist(), &block_101(&spk_a, &spk_b), &events).unwrap();
         assert!(rx.try_recv().is_err(), "nothing is watched, nothing is framed");
 
         let _ = std::fs::remove_file(path);
@@ -869,7 +873,7 @@ mod tests {
         seed(&idx, &spk_a);
 
         let (events, mut rx) = sinks(&[&spk_a]);
-        apply_block(&idx, &temp_used(), &temp_hist(), &block_101(&spk_a, &spk_b), &events).unwrap();
+        apply_block(&idx, &temp_hist(), &block_101(&spk_a, &spk_b), &events).unwrap();
 
         let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|f| serde_json::from_str(&f).unwrap())
@@ -891,7 +895,7 @@ mod tests {
         seed(&idx, &spk_a);
         let hist = temp_hist();
 
-        apply_block(&idx, &temp_used(), &hist, &block_101(&spk_a, &spk_b), &sinks(&[]).0).unwrap();
+        apply_block(&idx, &hist, &block_101(&spk_a, &spk_b), &sinks(&[]).0).unwrap();
         assert_eq!(hist.coverage().unwrap(), Some((101, 101)), "a fresh store starts at this block");
         let by_a = hist.history(&[spk_a.clone()], 0, 10).unwrap().unwrap();
         assert_eq!(by_a.transactions, vec![(101, [0xBB; 32])], "A paid and took change: once");
@@ -902,7 +906,7 @@ mod tests {
             "B was paid by the coinbase and by A (same height: txid order)"
         );
 
-        rewind_one(&idx, &temp_used(), &hist, &ev()).unwrap();
+        rewind_one(&idx, &hist, &ev()).unwrap();
         assert_eq!(hist.cursor().unwrap(), Some((100, [1u8; 32])));
         assert!(hist.history(&[spk_b.clone()], 0, 10).unwrap().is_none(), "nothing covered: honest, not empty");
         let mut other = block_101(&spk_a, &spk_b);
@@ -912,10 +916,32 @@ mod tests {
             "vin": [{ "coinbase": "aa" }],
             "vout": [{ "n": 0, "value": 3.125, "scriptPubKey": { "hex": hex::encode_dummy(&spk_a) } }]
         }]);
-        apply_block(&idx, &temp_used(), &hist, &other, &sinks(&[]).0).unwrap();
+        apply_block(&idx, &hist, &other, &sinks(&[]).0).unwrap();
         assert_eq!(hist.coverage().unwrap(), Some((101, 101)));
         assert!(hist.history(&[spk_b], 0, 10).unwrap().unwrap().transactions.is_empty(), "the rewound block's entries are gone");
         assert_eq!(hist.history(&[spk_a], 0, 10).unwrap().unwrap().transactions, vec![(101, [0xCC; 32])]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_node_tip_below_the_index_rewinds_instead_of_stalling() {
+        use crate::server::tests::{err, fake_node, ok};
+        let (idx, path) = temp_index();
+        let spk_a = BtcIndex::script_pubkey_for(ADDR_A).unwrap();
+        let spk_b = BtcIndex::script_pubkey_for(ADDR_B).unwrap();
+        seed(&idx, &spk_a);
+        let hist = temp_hist();
+        apply_block(&idx, &hist, &block_101(&spk_a, &spk_b), &sinks(&[]).0).unwrap();
+        let url = fake_node(|method, params| match method {
+            "getblockcount" => ok(json!(100)),
+            "getblockhash" if params[0] == 100 => ok(json!(hex_rev(&[1u8; 32]))),
+            "getblockhash" => err(-8, "Block height out of range"),
+            _ => err(-32601, "Method not found"),
+        })
+        .await;
+        converge(&idx, &hist, &BtcRpc::for_test(&url), &sinks(&[]).0).await.unwrap();
+        assert_eq!(idx.tip().unwrap().map(|(h, _)| h), Some(100));
+        assert_eq!(hist.cursor().unwrap(), Some((100, [1u8; 32])));
         let _ = std::fs::remove_file(path);
     }
 }
