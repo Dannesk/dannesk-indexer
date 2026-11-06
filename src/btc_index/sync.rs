@@ -197,6 +197,7 @@ async fn step(
 struct WatchedTx {
     txid: String,
     fee_sats: u64,
+    vsize: Option<u64>,
     spent: Range<usize>,
     created: Range<usize>,
 }
@@ -286,6 +287,7 @@ fn apply_block(idx: &BtcIndex, hist: &HistoryIndex, block: &Value, events: &Sync
                     Some(v) => sats(v)?,
                     None => 0,
                 },
+                vsize: tx["vsize"].as_u64(),
                 spent: first_spent..spent.len(),
                 created: first_created..created.len(),
             });
@@ -407,6 +409,7 @@ fn confirmed_tx_frame(
         "height": height,
         "blocktime": blocktime,
         "fees": tx.fee_sats.to_string(),
+        "vsize": tx.vsize,
         "inputs": inputs,
         "outputs": outputs
     })
@@ -622,6 +625,7 @@ mod tests {
                 {
                     "txid": hex_rev(&[0xBB; 32]),
                     "fee": 0.00001,
+                    "vsize": 153,
                     "vin": [{
                         "txid": hex_rev(&[0xAA; 32]),
                         "vout": 0,
@@ -834,6 +838,7 @@ mod tests {
         assert_eq!(paid["height"], 101);
         assert_eq!(paid["blocktime"], 1_786_761_453u64);
         assert_eq!(paid["fees"], "1000");
+        assert_eq!(paid["vsize"], 153);
         assert_eq!(paid["inputs"][0]["address"], ADDR_A);
         assert_eq!(paid["inputs"][0]["sats"], 50_000);
         assert_eq!(paid["outputs"][0]["address"], ADDR_B);

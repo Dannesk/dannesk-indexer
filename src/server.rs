@@ -215,7 +215,6 @@ async fn subscribe(
 
     let blocks_rx = ready.blocks.subscribe();
     let txs_rx = ready.txs.subscribe();
-    // The pending sends first: a txid is a set insert, and the follower matches on it from here.
     let mut txids = 0;
     for t in req["txids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
         match valid_txid(t) {
@@ -226,8 +225,7 @@ async fn subscribe(
             None => debug!("subscribe_events: skipped invalid txid {}", t),
         }
     }
-    // The list is registered on the blocking pool, each address being a store read: a relay's whole
-    // set must never leave this task silent, its pings unanswered and its goodbye unheard.
+  
     let listed: Vec<String> = req["addresses"]
         .as_array()
         .into_iter()
@@ -852,6 +850,7 @@ async fn tx_detail(req: &Value, state: &str, rpc: &BtcRpc) -> Value {
                 .as_f64()
                 .map(|f| ((f * 1e8).round() as u64).to_string())
                 .unwrap_or_else(|| "0".to_string()),
+            "vsize": tx["vsize"].as_u64(),
             "inputs": inputs,
             "outputs": outputs,
         }
@@ -1249,6 +1248,31 @@ pub(crate) mod tests {
         let resp = answer(&ask, None, &state_rx, &node_rx, &dead).await;
         assert_eq!(resp["no_answer"], true, "{resp}");
         assert!(resp.get("tx").is_none());
+    }
+
+    #[tokio::test]
+    async fn tx_detail_frames_the_fee_and_size_the_node_reports() {
+        let (_state_tx, state_rx, _node_tx, node_rx) = states();
+        let ask = json!({ "method": "tx_detail", "txid": TXID, "height": 100 });
+        let url = fake_node(|method, _| match method {
+            "getblockhash" => ok(json!("blockhash")),
+            "getrawtransaction" => ok(json!({
+                "txid": TXID,
+                "vsize": 141,
+                "fee": 0.00000141,
+                "blocktime": 1_786_761_453u64,
+                "vin": [{ "prevout": { "value": 0.0005, "scriptPubKey": { "address": ADDR2 } } }],
+                "vout": [{ "n": 0, "value": 0.0004, "scriptPubKey": { "address": ADDR, "hex": "0014751e76e8199196d454941c45d1b3a323f1433bd6" } }]
+            })),
+            _ => err(-32601, "Method not found"),
+        })
+        .await;
+        let resp = answer(&ask, None, &state_rx, &node_rx, &BtcRpc::for_test(&url)).await;
+        assert_eq!(resp["tx"]["type"], "confirmed_tx", "{resp}");
+        assert_eq!(resp["tx"]["fees"], "141");
+        assert_eq!(resp["tx"]["vsize"], 141);
+        assert_eq!(resp["tx"]["inputs"][0]["address"], ADDR2);
+        assert_eq!(resp["tx"]["outputs"][0]["address"], ADDR);
     }
 
     #[tokio::test]
